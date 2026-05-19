@@ -239,8 +239,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         
         await context.bot.send_message(
             chat_id=user.id, 
-            text=f"📋 **تم إنشاء الهيكل النصي:**\n\n```markdown\n{markdown}\n
-```\n\n⏳ جاري توليد الصورة المرئية...",
+            text=f"📋 **تم إنشاء الهيكل النصي:**\n\n```markdown\n{markdown}\n```\n\n⏳ جاري توليد الصورة المرئية...",
             parse_mode="Markdown"
         )
         await mindmap_queue.put((user.id, user.id, markdown))
