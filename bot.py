@@ -309,8 +309,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         
         await context.bot.send_message(
             chat_id=user.id, 
-            text=f"📋 **تم إنشاء هيكل الخريطة النصي:**\n\n```markdown\n{markdown}\n
-```\n\n⏳ جاري إرسال البيانات الآن لنموذج التصوير المتقدم لتوليد خريطتك المرئية...",
+            text=f"📋 **تم إنشاء هيكل الخريطة النصي:**\n\n```markdown\n{markdown}\n```\n\n⏳ جاري إرسال البيانات الآن لنموذج التصوير المتقدم لتوليد خريطتك المرئية...",
             parse_mode="Markdown"
         )
         
