@@ -20,7 +20,6 @@ from google.genai import types
 import PyPDF2
 
 # --- الإعدادات والثوابت من متغيرات البيئة ---
-# السيرفر الحقيقي يجب أن يقرأ المفاتيح من البيئة مباشرة لأمان البيانات
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
@@ -59,7 +58,7 @@ def setup_db():
 
 async def get_user_state_async(user_id: int):
     """تحصل على حالة المستخدم الحالية بشكل غير متزامن."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     def get():
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
@@ -69,7 +68,7 @@ async def get_user_state_async(user_id: int):
 
 async def set_user_state_async(user_id: int, state: str, text: Optional[str] = None):
     """تحفظ حالة المستخدم الحالية بشكل غير متزامن."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     def set():
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
@@ -82,7 +81,7 @@ async def set_user_state_async(user_id: int, state: str, text: Optional[str] = N
 # --- 2. معالجة الملفات (PDF) - محليًا في Thread منفصل ---
 async def extract_text_from_pdf_async(file_path: str):
     """تستخرج النص من ملف PDF بشكل غير متزامن لتجنب الجمود."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     def extract():
         text = ""
         with open(file_path, 'rb') as file:
@@ -98,7 +97,7 @@ async def extract_text_from_pdf_async(file_path: str):
 # --- 3. دوال التواصل مع Gemini (تحليل وتلخيص وترجمة) ---
 async def call_gemini_async(model: str, contents: list):
     """تتصل بـ Gemini API لإنشاء النصوص بشكل غير متزامن."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     def call():
         response = client.models.generate_content(
             model=model,
@@ -112,7 +111,6 @@ async def call_gemini_async(model: str, contents: list):
 async def generate_mindmap_image_async(markdown_text: str) -> bytes:
     """تتصل بـ API الحقيقي (Imagen 3) لتوليد صورة الخريطة الذهنية وإعادتها كـ Bytes."""
     
-    # البرومت المحسن والموجه لنموذج توليد الصور
     image_prompt = f"""
 Create a professional, modern, and beautifully formatted visual mind map based on this structure.
 The central topic must be bold and located in the dead center of the image.
@@ -124,22 +122,19 @@ Do NOT include any raw markdown characters like # or ## or asterisks in the fina
 Structure to visualize:
 {markdown_text}
 """
-    
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     
     def call_imagen():
         logger.info("Calling Imagen API for image generation...")
-        # استدعاء نموذج Imagen 3 الرسمي من جوجل لتوليد الصورة
         result = client.models.generate_images(
             model='imagen-3.0-generate-002',
             prompt=image_prompt,
             config=types.GenerateImagesConfig(
                 number_of_images=1,
                 output_mime_type="image/jpeg",
-                aspect_ratio="16:9" # أبعاد ممتازة للخرائط الذهنية والعرض على الموبايل
+                aspect_ratio="16:9"
             )
         )
-        # استخراج البايتات الخاصة بالصورة الأولى المتولدة
         return result.generated_images[0].image.image_bytes
 
     return await loop.run_in_executor(None, call_imagen)
@@ -160,20 +155,15 @@ async def banana_worker(context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Worker started processing mindmap image for user {user_id}")
         
         try:
-            # 1. إشعار المستخدم ببدء التوليد الحقيقي
             await context.bot.send_message(
                 chat_id=chat_id, 
                 text="🤖 بدأ نموذج التصوير الذكي العمل على تصميم خريطتك الذهنية المرئية... يستغرق الأمر عادةً من 10 إلى 20 ثانية."
             )
             
-            # 2. استدعاء الـ API الحقيقي لاستلام بايتات الصورة
             image_bytes = await generate_mindmap_image_async(markdown)
-            
-            # 3. تحويل البايتات إلى كائن ملف يقرأه تيليجرام في الذاكرة دون حفظه على القرص
             image_file = io.BytesIO(image_bytes)
             image_file.name = "mindmap.jpg"
             
-            # 4. إرسال الصورة للمهندس/المستخدم
             await context.bot.send_photo(
                 chat_id=chat_id, 
                 photo=InputFile(image_file), 
@@ -192,7 +182,7 @@ async def banana_worker(context: ContextTypes.DEFAULT_TYPE):
             
         finally:
             mindmap_queue.task_done()
-            await asyncio.sleep(1) # حماية للسيرفر وفاصل زمني قصير بين المهام
+            await asyncio.sleep(1)
 
 
 # --- 6. معالجات تيليجرام (Bot Handlers) ---
@@ -293,33 +283,33 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("🧠 جاري بناء هيكل خريطة ذهنية نصي أولاً...")
         
         markdown_prompt = f"""
-حلل النص التالي لإنشاء خريطة ذهنية هرمية دقيقة بتنسيق Markdown. يجب أن يكون الهيكل كالتالي:
-# الموضوع المركزي
-## الفرع الرئيسي 1
-### الفرع الفرعي 1.1
-- نقطة فرعية مفصلة
+        حلل النص التالي لإنشاء خريطة ذهنية هرمية دقيقة بتنسيق Markdown. يجب أن يكون الهيكل كالتالي:
+        # الموضوع المركزي
+        ## الفرع الرئيسي 1
+        ### الفرع الفرعي 1.1
+        - نقطة فرعية مفصلة
 
-استخدم كلمات دلالية واضحة وأيقونات تعبيرية مناسبة جداً للسياق. وزع الفروع بتوازن.
-أعد الهيكل النصي فقط بدون أي مقدمات أو مؤخرات.
+        استخدم كلمات دلالية واضحة وأيقونات تعبيرية مناسبة جداً للسياق. وزع الفروع بتوازن.
+        أعد الهيكل النصي فقط بدون أي مقدمات أو مؤخرات.
 
-النص المراد تحليله:
-{current_text}
-"""
+        النص المراد تحليله:
+        {current_text}
+        """
         markdown = await call_gemini_async(model='gemini-1.5-flash', contents=[markdown_prompt])
         
+        # السطر بعد إصلاح المشكلة النصية السابقة تماماً هنا:
         await context.bot.send_message(
             chat_id=user.id, 
             text=f"📋 **تم إنشاء هيكل الخريطة النصي:**\n\n```markdown\n{markdown}\n```\n\n⏳ جاري إرسال البيانات الآن لنموذج التصوير المتقدم لتوليد خريطتك المرئية...",
             parse_mode="Markdown"
         )
         
-        # دفع المهمة لـ Queue المعالجة الخلفية للصور
         await queue_mindmap_task(user.id, user.id, markdown)
 
 
 # --- 7. تشغيل البوت الحقيقي (Main) ---
-async def main():
-    """تهيئة وتشغيل البوت والعمل في الخلفية بشكل متزامن."""
+def main():
+    """تهيئة وتشغيل البوت والعمل في الخلفية بشكل متزامن متوافق مع سيرفر Render."""
     setup_db()
     
     # بناء تطبيق تيليجرام
@@ -330,22 +320,21 @@ async def main():
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(CallbackQueryHandler(handle_callback_query))
     
-    # تشغيل عامل توليد الصور الخلفي كمهام خلفية غير حاصرة
-    asyncio.create_task(banana_worker(application))
+    # تشغيل عامل توليد الصور الخلفي كمهام خلفية عبر الـ loop المدمج بالتطبيق
+    application.job_queue.run_once(lambda ctx: asyncio.create_task(banana_worker(ctx)), when=0)
 
     logger.info("Bot is deploying on production server...")
     
-    # التشغيل عن طريق Polling (ممتاز جداً للسيرفرات الـ VPS الخاصة)
-    #await application.run_polling()
+    # قراءة الـ Port من متغيرات البيئة تلقائياً كما يطلب سيرفر Render
+    port = int(os.environ.get("PORT", 8443))
     
-    # ملاحظة إذا أردت الانتقال إلى Webhook بالكامل على خوادم مثل Heroku/Render:
-    # قم بتعليق سطر run_polling واستخدم السطر أدناه مع تمرير الروابط والـ Port المناسب:
-    await application.run_webhook(listen="0.0.0.0", port=int(os.environ.get("PORT", 8443)), url_path=BOT_TOKEN, webhook_url=f"https://yourdomain.com/{BOT_TOKEN}")
+    # تشغيل الـ Webhook بدون إغلاق الـ loop يدوياً
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=BOT_TOKEN,
+        webhook_url=f"https://yourdomain.render.com/{BOT_TOKEN}" 
+    )
 
 if __name__ == '__main__':
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(main())
-    except Exception as e:
-        logger.critical(f"Bot crashed on start: {e}")
+    main()
