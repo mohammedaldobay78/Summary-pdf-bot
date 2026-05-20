@@ -27,6 +27,7 @@ BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GOOGLE_API_KEY = os.getenv("GEMINI_API_KEY")
+ADMIN_ID = os.getenv("ADMIN_ID")
 PROVIDER_TOKEN = "" 
 
 app = Flask(__name__)
@@ -74,6 +75,7 @@ async def get_or_create_user(tg_user: User, context: ContextTypes.DEFAULT_TYPE, 
             ref_data = db_request("GET", "users", params={"user_id": f"eq.{referrer_id}"})
             if ref_data:
                 current_points = ref_data[0]["points"]
+                # إضافة نقطتين للشخص الذي قام بالدعوة وتخزين المعرف في حقل مخصص للاحالات إن وجد
                 db_request("PATCH", "users", params={"user_id": f"eq.{referrer_id}"}, json_data={"points": current_points + 2})
                 try:
                     await context.bot.send_message(chat_id=int(referrer_id), text="🎉 سجل مستخدم جديد عن طريق رابطك! تم إضافة نقطتين إلى رصيدك.")
@@ -84,7 +86,8 @@ async def get_or_create_user(tg_user: User, context: ContextTypes.DEFAULT_TYPE, 
             "user_id": user_id,
             "username": tg_user.username or "",
             "points": 0,
-            "last_daily_gift": "1970-01-01"
+            "last_daily_gift": "1970-01-01",
+            "referred_by": referrer_id if referrer_id else None  # حفظ من قام بدعوته لحساب الإحصائيات بدقة
         }
         db_request("POST", "users", json_data=new_user)
         
@@ -102,6 +105,16 @@ async def get_or_create_user(tg_user: User, context: ContextTypes.DEFAULT_TYPE, 
         data = db_request("GET", "users", params={"user_id": f"eq.{user_id}"})
     
     return data[0] if data else {"user_id": user_id, "points": 0, "last_daily_gift": "1970-01-01"}
+
+def get_invited_count(user_id):
+    # جلب عدد الأشخاص الذين يمتلكون حقل referred_by يساوي المعرف الحالي لحساب الإحالات الحقيقية
+    res = requests.get(
+        f"{SUPABASE_URL}/rest/v1/users", 
+        headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Prefer": "count=exact"},
+        params={"referred_by": f"eq.{user_id}"}
+    )
+    count = res.headers.get("Content-Range", "0-0/0").split("/")[-1]
+    return count
 
 def check_and_reset_limits(user_id):
     today = str(datetime.date.today())
@@ -130,19 +143,30 @@ def get_dynamic_channel():
     return data[0]["value"] if data else None
 
 async def is_subscribed(bot, user_id):
+    if ADMIN_ID and str(user_id) == str(ADMIN_ID):
+        return True
+        
+    chk_channel = PRIMARY_CHANNEL if PRIMARY_CHANNEL.startswith("@") else f"@{PRIMARY_CHANNEL}"
     try:
-        member = await bot.get_chat_member(PRIMARY_CHANNEL, user_id)
-        if member.status in ['left', 'kicked']: return False
-    except Exception:
-        return False
-    
+        member = await bot.get_chat_member(chk_channel, int(user_id))
+        if member.status in ['left', 'kicked']: 
+            return False
+    except Exception as e:
+        print(f"⚠️ Error checking primary channel sub: {e}")
+        if "Chat not found" in str(e) or "Not member" in str(e):
+            return False
+
     dyn_channel = get_dynamic_channel()
     if dyn_channel:
+        chk_dyn = dyn_channel if dyn_channel.startswith("@") else f"@{dyn_channel}"
         try:
-            member = await bot.get_chat_member(dyn_channel, user_id)
-            if member.status in ['left', 'kicked']: return False
-        except Exception:
-            return False
+            member = await bot.get_chat_member(chk_dyn, int(user_id))
+            if member.status in ['left', 'kicked']: 
+                return False
+        except Exception as e:
+            print(f"⚠️ Error checking dynamic channel sub: {e}")
+            if "Chat not found" in str(e) or "Not member" in str(e):
+                return False
             
     return True
 
@@ -151,12 +175,18 @@ async def is_subscribed(bot, user_id):
 # ----------------------------------------------------------------
 def main_menu_keyboard():
     keyboard = [
-        [InlineKeyboardButton("⚙️ لوحة الإعدادات", callback_data="user_settings")],
+        [InlineKeyboardButton("👤 حسابي", callback_data="my_account")],
+        [InlineKeyboardButton("🎁 الهدية اليومية", callback_data="daily_gift")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def account_keyboard():
+    keyboard = [
         [
-            InlineKeyboardButton("🎁 الهدية اليومية", callback_data="daily_gift"),
-            InlineKeyboardButton("🔗 رابط الإحالة", callback_data="referral_link")
+            InlineKeyboardButton("🔗 رابط الإحالة", callback_data="referral_link"),
+            InlineKeyboardButton("⭐ شحن نقاط (نجوم)", callback_data="buy_stars")
         ],
-        [InlineKeyboardButton("⭐ شحن نقاط (نجوم)", callback_data="buy_stars")]
+        [InlineKeyboardButton("🔙 العودة للقائمة الرئيسية", callback_data="main_menu")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -171,6 +201,18 @@ def admin_keyboard():
 # ----------------------------------------------------------------
 # 4. معالجة الأوامر الأساسية
 # ----------------------------------------------------------------
+def get_services_text():
+    return (
+        "👋 *أهلاً بك في بوت معالجة وتلخيص المحاضرات الذكي!*\n\n"
+        "💡 *قائمة الخدمات المتاحة وكيفية استخدامها:*\n"
+        "• 📄 *تلخيص ملفات الـ PDF:* أرسل أي ملف محاضرة بصيغة PDF مباشرة ليقوم البوت بتلخيصه بذكاء.\n"
+        "• 🎙️ *التفريغ الصوتي الذكي:* أرسل أي ملف صوتي أو ريكورد ليقوم البوت بتحويله إلى نص مكتوب.\n"
+        "• 🌐 *الترجمة الأكاديمية:* أرسل كلمة (ترجم) متبوعة بنصك لترجمته فوراً، مثال: `ترجم Hello world`\n"
+        "• 📊 *إنفوجرافيك ذكي:* أرسل كلمة (انفوجرافيك) متبوعة بالموضوع لتوليد رسم بياني وتوضيحي.\n"
+        "• 🧠 *المخططات الذهنية:* أرسل كلمة (مخطط ذهني) متبوعة بالفكرة لتوليد صورة خارطة مفاهيم متكاملة.\n\n"
+        "👇 استخدم الأزرار أدناه للتحكم بحسابك واستلام جوائزك اليومية:"
+    )
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     args = context.args
@@ -184,14 +226,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
-        text="👋 أهلاً بك في بوت معالجة وتلخيص المحاضرات الذكي.\n\n"
-             "قم بإرسال الملفات أو التسجيلات الصوتية مباشرة، أو استخدم القائمة أدناه لإدارة حسابك:",
+        text=get_services_text(),
+        parse_mode="Markdown",
         reply_markup=main_menu_keyboard()
     )
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin_id = os.getenv("ADMIN_ID")
-    if str(update.effective_user.id) != str(admin_id): return
+    if str(update.effective_user.id) != str(ADMIN_ID): return
     await context.bot.send_message(
         chat_id=update.effective_chat.id, 
         text="🛠️ لوحة تحكم الإدارة الصارمة:", 
@@ -200,10 +241,12 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def send_subscription_requirement(chat_id, bot):
     dyn_channel = get_dynamic_channel()
-    keyboard = [[InlineKeyboardButton("1️⃣ القناة الأساسية", url=f"https://t.me/{PRIMARY_CHANNEL.replace('@','')}")]]
+    clean_primary = PRIMARY_CHANNEL.replace('@','')
+    keyboard = [[InlineKeyboardButton("1️⃣ القناة الأساسية", url=f"https://t.me/{clean_primary}")]]
     
     if dyn_channel:
-        keyboard.append([InlineKeyboardButton("2️⃣ القناة الإضافية", url=f"https://t.me/{dyn_channel.replace('@','')} column")])
+        clean_dyn = dyn_channel.replace('@','')
+        keyboard.append([InlineKeyboardButton("2️⃣ القناة الإضافية", url=f"https://t.me/{clean_dyn}")])
         
     keyboard.append([InlineKeyboardButton("✅ تحقق من الاشتراك", callback_data="verify_sub")])
     markup = InlineKeyboardMarkup(keyboard)
@@ -226,36 +269,43 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if query.data == "verify_sub":
         if await is_subscribed(context.bot, user_id):
-            await query.message.delete()
-            await context.bot.send_message(chat_id=chat_id, text="✅ تم تأكيد الاشتراك بنجاح.", reply_markup=main_menu_keyboard())
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            await context.bot.send_message(chat_id=chat_id, text=get_services_text(), parse_mode="Markdown", reply_markup=main_menu_keyboard())
         else:
-            await context.bot.answer_callback_query(callback_query_id=query.id, text="❌ لم تشترك في جميع القنوات بعد!", show_alert=True)
+            await context.bot.answer_callback_query(callback_query_id=query.id, text="❌ لم تشترك في جميع القنوات بعد! تأكد من انضمامك ثم اضغط مجدداً.", show_alert=True)
 
-    elif query.data == "user_settings":
+    elif query.data == "my_account":
         user = await get_or_create_user(query.from_user, context)
+        invited_count = get_invited_count(user_id)
         limits = check_and_reset_limits(user_id)
         
+        display_name = query.from_user.full_name or query.from_user.username or "مستخدم غامض"
+        
         text = (
-            f"👤 *لوحة إعدادات المستخدم*\n\n"
+            f"👤 *تفاصيل حسابي الأساسية*\n\n"
+            f"👤 الإسم: *{display_name}*\n"
             f"🆔 معرف الحساب: `{user_id}`\n"
-            f"🪙 رصيد النقاط المدفوعة: *{user['points']}* نقطة\n\n"
-            f"📊 الاستهلاك المجاني المتبقي اليوم:\n"
+            f"🪙 رصيد النقاط: *{user['points']}* نقطة\n"
+            f"👥 عدد الأشخاص المدعوين: *{invited_count}* شخص\n\n"
+            f"📊 المحاولات المجانية المتبقية اليوم:\n"
             f"📄 تلخيص PDF: {3 - limits['pdf_count']}/3\n"
-            f"🌐 الترجمة: {3 - limits['translate_count']}/3\n"
+            f"🌐 الترجمة الأكاديمية: {3 - limits['translate_count']}/3\n"
             f"🎙️ تفريغ الصوت: {1 - limits['voice_count']}/1\n"
             f"📊 إنفوجرافيك: {2 - limits['info_count']}/2\n"
             f"🧠 مخطط ذهني: {2 - limits['mind_count']}/2"
         )
-        keyboard = [[InlineKeyboardButton("🔙 العودة للقائمة الرئيسية", callback_data="main_menu")]]
-        await query.edit_message_text(text=text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(text=text, parse_mode="Markdown", reply_markup=account_keyboard())
 
     elif query.data == "main_menu":
-        await query.edit_message_text(text="👋 قائمة البوت الرئيسية لمساعدتك في تلخيص المحاضرات:", reply_markup=main_menu_keyboard())
+        await query.edit_message_text(text=get_services_text(), parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
     elif query.data == "referral_link":
         link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
-        text = f"🔗 *رابط الإحالة الخاص بك:*\n\n`{link}`\n\n لكل صديق يسجل ستحصل على *2 نقاط*."
-        keyboard = [[InlineKeyboardButton("🔙 العودة", callback_data="main_menu")]]
+        text = f"🔗 *رابط الإحالة الخاص بك:*\n\n`{link}`\n\nقم بنشره! لكل صديق يسجل في البوت من خلال رابطك، ستحصل تلقائياً على *2 نقاط* إضافية مجاناً."
+        keyboard = [[InlineKeyboardButton("🔙 العودة إلى حسابي", callback_data="my_account")]]
         await query.edit_message_text(text=text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
     elif query.data == "daily_gift":
@@ -263,17 +313,17 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         today_str = str(datetime.date.today())
         
         if user["last_daily_gift"] == today_str:
-            await context.bot.answer_callback_query(callback_query_id=query.id, text="❌ لقد حصلت على هديتك اليومية بالفعل!", show_alert=True)
+            await context.bot.answer_callback_query(callback_query_id=query.id, text="❌ لقد حصلت على هديتك اليومية بالفعل! عد غداً لمكافأة جديدة.", show_alert=True)
         else:
             db_request("PATCH", "users", params={"user_id": f"eq.{user_id}"}, json_data={"points": user["points"] + 2, "last_daily_gift": today_str})
-            await context.bot.answer_callback_query(callback_query_id=query.id, text="🎉 تم استلام 2 نقاط بنجاح كمكافأة يومية!", show_alert=True)
+            await context.bot.answer_callback_query(callback_query_id=query.id, text="🎉 مبروك! تم استلام 2 نقاط بنجاح كمكافأة يومية لحسابك.", show_alert=True)
 
     elif query.data == "buy_stars":
         prices = [LabeledPrice(label="شحن رصيد نقاط", amount=1)]
         await context.bot.send_invoice(
             chat_id=chat_id, 
             title="شحن نقاط", 
-            description="1 نجمة = 3 نقاط.", 
+            description="1 نجمة تلجرام تعادل 3 نقاط داخل البوت.", 
             provider_token=PROVIDER_TOKEN, 
             currency="XTR", 
             prices=prices, 
@@ -282,13 +332,13 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif query.data == "admin_stats":
-        if str(query.from_user.id) != os.getenv("ADMIN_ID"): return
+        if str(query.from_user.id) != str(ADMIN_ID): return
         res = requests.get(f"{SUPABASE_URL}/rest/v1/users", headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Prefer": "count=exact"})
         count = res.headers.get("Content-Range", "0-0/0").split("/")[-1]
         await context.bot.send_message(chat_id=chat_id, text=f"📊 إجمالي عدد المستخدمين المسجلين: {count}")
 
     elif query.data in ["admin_set_channel", "admin_broadcast"]:
-        if str(query.from_user.id) != os.getenv("ADMIN_ID"): return
+        if str(query.from_user.id) != str(ADMIN_ID): return
         context.user_data["admin_action"] = query.data
         msg = "قم بإرسال معرف القناة الجديد الآن مع الـ @:" if query.data == "admin_set_channel" else "أرسل نص الرسالة التي تريد بثها:"
         await context.bot.send_message(chat_id=chat_id, text=msg)
@@ -298,7 +348,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ----------------------------------------------------------------
 async def handle_admin_replies(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = context.user_data.get("admin_action")
-    if not action or str(update.effective_user.id) != os.getenv("ADMIN_ID"):
+    if not action or str(update.effective_user.id) != str(ADMIN_ID):
         return
         
     text = update.message.text.strip()
@@ -348,7 +398,7 @@ async def process_billing_and_run(update: Update, context: ContextTypes.DEFAULT_
             if await worker_func(context.bot, chat_id, *args):
                 db_request("PATCH", "users", params={"user_id": f"eq.{user_id}"}, json_data={"points": user["points"] - points_cost})
         else:
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ نفدت محاولاتك المجانية. تحتاج {points_cost} نقاط لإتمام العملية.")
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ نفدت محاولاتك المجانية اليومية لهذا القسم. تحتاج إلى {points_cost} نقاط لإتمام العملية.")
 
 # ----------------------------------------------------------------
 # 8. التكامل مع خدمات Google GenAI SDK
@@ -448,7 +498,7 @@ async def handle_text_requests(update: Update, context: ContextTypes.DEFAULT_TYP
         await process_billing_and_run(update, context, "mind_count", 2, 5, run_generate_image, prompt, "mindmap")
     else:
         await update.message.reply_text(
-            "ℹ️ الصيغ المدعومة:\n• `ترجم [النص]`\n• `انفوجرافيك [الموضوع]`\n• `مخطط ذهني [الموضوع]`\n• أو أرسل ملف PDF أو تسجيل صوتي مباشرة."
+            "ℹ️ الصيغ المدعومة والمباشرة للخدمات:\n• `ترجم [النص]`\n• `انفوجرافيك [الموضوع]`\n• `مخطط ذهني [الموضوع]`\n• أو قم بإرسال ملف PDF أو تسجيل صوتي فوراً لتبدأ المعالجة."
         )
 
 # ----------------------------------------------------------------
@@ -484,7 +534,6 @@ ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_
 # 11. إعدادات خادم Webhook و Flask وتوافق الـ Cron Job المنفصل
 # ----------------------------------------------------------------
 
-# دالة موحدة لتجهيز البوت والـ Webhook داخل Event Loop واحد لمنع الـ RuntimeError
 async def init_bot_and_webhook():
     await ptb_app.initialize()
     render_url = os.getenv("RENDER_EXTERNAL_URL")
@@ -501,13 +550,11 @@ asyncio.run(init_bot_and_webhook())
 def getMessage():
     if request.method == "POST":
         update = Update.de_json(request.get_json(force=True), ptb_app.bot)
-        # معالجة التحديث فوراً دون إعادة التهيئة
         asyncio.run(ptb_app.process_update(update))
         return "!", 200
 
 @app.route("/")
 def webhook():
-    # الرابط الرئيسي المخصص لبنق الـ Cron Job دون لمس البوت أو إغلاق الـ Loop
     return "Bot Core Status: ALIVE & MONITORING", 200
 
 if __name__ == "__main__":
