@@ -479,7 +479,7 @@ ptb_app.add_handler(CallbackQueryHandler(handle_callbacks))
 ptb_app.add_handler(PreCheckoutQueryHandler(checkout))
 ptb_app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, got_payment))
 ptb_app.add_handler(MessageHandler(filters.Document.PDF, handle_docs))
-ptb_app.add_handler(filters = (filters.VOICE | filters.AUDIO), callback=handle_audio)
+ptb_app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_audio))
 ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_requests))
 
 # ----------------------------------------------------------------
