@@ -159,7 +159,7 @@ def admin_keyboard():
 # ----------------------------------------------------------------
 # 4. معالجة الأوامر الأساسية
 # ----------------------------------------------------------------
-@bot.message_with_type_handler(commands=['start'])
+@bot.message_reaction_handler(commands=['start'])
 def cmd_start(message):
     user_id = str(message.from_user.id)
     args = message.text.split()
@@ -178,7 +178,7 @@ def cmd_start(message):
         reply_markup=main_menu_keyboard()
     )
 
-@bot.message_with_type_handler(commands=['admin'])
+@bot.message_reaction_handler(commands=['admin'])
 def cmd_admin(message):
     admin_id = os.getenv("ADMIN_ID")
     if str(message.from_user.id) != str(admin_id): return
@@ -385,7 +385,7 @@ def run_generate_image(chat_id, prompt_text, image_type):
 # ----------------------------------------------------------------
 # 9. معالجة الرسائل الواردة
 # ----------------------------------------------------------------
-@bot.message_with_type_handler(content_types=['document'])
+@bot.message_reaction_handler(content_types=['document'])
 def handle_docs(message):
     if message.document.mime_type == 'application/pdf':
         file_info = bot.get_file(message.document.file_id)
@@ -395,7 +395,7 @@ def handle_docs(message):
         
         process_billing_and_run(str(message.from_user.id), message.chat.id, "pdf_count", 3, 3, run_pdf_summary, message.chat.id, file_path)
 
-@bot.message_with_type_handler(content_types=['voice', 'audio'])
+@bot.message_reaction_handler(content_types=['voice', 'audio'])
 def handle_audio(message):
     file_id = message.voice.file_id if message.voice else message.audio.file_id
     file_info = bot.get_file(file_id)
@@ -405,7 +405,7 @@ def handle_audio(message):
         
     process_billing_and_run(str(message.from_user.id), message.chat.id, "voice_count", 1, 2, run_voice_transcription, message.chat.id, file_path)
 
-@bot.message_with_type_handler(content_types=['text'])
+@bot.message_reaction_handler(content_types=['text'])
 def handle_text_requests(message):
     text = message.text.strip()
     user_id = str(message.from_user.id)
@@ -429,7 +429,7 @@ def handle_text_requests(message):
 def checkout(pre_checkout_query):
     bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
 
-@bot.message_with_type_handler(content_types=['successful_payment'])
+@bot.message_reaction_handler(content_types=['successful_payment'])
 def got_payment(message):
     user_id = str(message.from_user.id)
     payload = message.successful_payment.invoice_payload
