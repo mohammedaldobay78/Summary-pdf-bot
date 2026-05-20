@@ -7,7 +7,7 @@ from google import genai
 from google.genai import types
 import requests
 
-# استيراد مكتبة python-telegram-bot المحدثة
+# استيراد مكتبة python-telegram-bot
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, User
 from telegram.ext import (
     Application,
@@ -36,7 +36,7 @@ ai_client = genai.Client(api_key=GOOGLE_API_KEY)
 
 PRIMARY_CHANNEL = "@Axia_Tech"
 
-# تهيئة تطبيق البوت (python-telegram-bot) بدون تشغيل الـ Polling لأننا سنستخدم Webhook
+# تهيئة تطبيق البوت
 ptb_app = Application.builder().token(TOKEN).build()
 
 # ----------------------------------------------------------------
@@ -294,7 +294,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=chat_id, text=msg)
 
 # ----------------------------------------------------------------
-# 6. وظائف الإدارة البديلة لـ (Conversation/Step Handler)
+# 6. وظائف الإدارة
 # ----------------------------------------------------------------
 async def handle_admin_replies(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = context.user_data.get("admin_action")
@@ -470,9 +470,7 @@ async def got_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_request("PATCH", "users", params={"user_id": f"eq.{user_id}"}, json_data={"points": user["points"] + added_points})
         await update.message.reply_text(f"🎉 تم شحن حسابك بـ {added_points} نقاط بنجاح.")
 
-# ----------------------------------------------------------------
-# تسجيل معالجات أحداث البوت (Handlers)
-# ----------------------------------------------------------------
+# تسجيل معالجات أحداث البوت
 ptb_app.add_handler(CommandHandler("start", cmd_start))
 ptb_app.add_handler(CommandHandler("admin", cmd_admin))
 ptb_app.add_handler(CallbackQueryHandler(handle_callbacks))
@@ -483,23 +481,30 @@ ptb_app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_audio))
 ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_requests))
 
 # ----------------------------------------------------------------
-# 11. إعدادات خادم Webhook و Flask وتوافق Render
+# 11. إعدادات خادم Webhook و Flask وتوافق الـ Cron Job المنفصل
 # ----------------------------------------------------------------
+
+# نقوم بتهيئة الـ Application مرة واحدة فقط عند إقلاع السيرفر الرئيسي وليس داخل الدوال
+asyncio.run(ptb_app.initialize())
+
 @app.route('/' + TOKEN, methods=['POST'])
 def getMessage():
     if request.method == "POST":
-        # تهيئة استقبال التحديثات وتمريرها لنظام الـ Asynchronous في مكتبة التليجرام الحديثة
         update = Update.de_json(request.get_json(force=True), ptb_app.bot)
-        asyncio.run(ptb_app.initialize())
+        # تشغيل فوري وبدون إعادة تهيئة (Initialize) لمنع التعارض
         asyncio.run(ptb_app.process_update(update))
         return "!", 200
 
 @app.route("/")
 def webhook():
-    render_url = os.getenv("RENDER_EXTERNAL_URL")
-    # تعيين رابط الـ Webhook رسمياً تزامناً مع تهيئة الـ Application
-    asyncio.run(ptb_app.bot.set_webhook(url=f"{render_url}/{TOKEN}"))
-    return "Bot Core Status: ACTIVE & MONITORING", 200
+    # هذا الرابط مخصص لاستقبال بنق الـ Cron Job للحفاظ على السيرفر حياً (Keep-alive) 
+    # دون المساس بإعدادات الـ Webhook النشطة أو تهيئة التطبيق مجدداً
+    return "Bot Core Status: ALIVE & MONITORING", 200
 
 if __name__ == "__main__":
+    # عند تشغيل الكود لأول مرة يتم ربط الـ Webhook رسمياً تلقائياً
+    render_url = os.getenv("RENDER_EXTERNAL_URL")
+    if render_url:
+        asyncio.run(ptb_app.bot.set_webhook(url=f"{render_url}/{TOKEN}"))
+        
     app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 5000)))
