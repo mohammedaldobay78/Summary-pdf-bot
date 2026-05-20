@@ -484,27 +484,31 @@ ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_
 # 11. إعدادات خادم Webhook و Flask وتوافق الـ Cron Job المنفصل
 # ----------------------------------------------------------------
 
-# نقوم بتهيئة الـ Application مرة واحدة فقط عند إقلاع السيرفر الرئيسي وليس داخل الدوال
-asyncio.run(ptb_app.initialize())
+# دالة موحدة لتجهيز البوت والـ Webhook داخل Event Loop واحد لمنع الـ RuntimeError
+async def init_bot_and_webhook():
+    await ptb_app.initialize()
+    render_url = os.getenv("RENDER_EXTERNAL_URL")
+    if render_url:
+        print(f"🔗 Setting webhook to: {render_url}/{TOKEN}")
+        await ptb_app.bot.set_webhook(url=f"{render_url}/{TOKEN}")
+    else:
+        print("⚠️ RENDER_EXTERNAL_URL not found, skipping webhook setup.")
+
+# تنفيذ التهيئة والربط في بيئة عمل موحدة ومستقرة قبل تشغيل Flask
+asyncio.run(init_bot_and_webhook())
 
 @app.route('/' + TOKEN, methods=['POST'])
 def getMessage():
     if request.method == "POST":
         update = Update.de_json(request.get_json(force=True), ptb_app.bot)
-        # تشغيل فوري وبدون إعادة تهيئة (Initialize) لمنع التعارض
+        # معالجة التحديث فوراً دون إعادة التهيئة
         asyncio.run(ptb_app.process_update(update))
         return "!", 200
 
 @app.route("/")
 def webhook():
-    # هذا الرابط مخصص لاستقبال بنق الـ Cron Job للحفاظ على السيرفر حياً (Keep-alive) 
-    # دون المساس بإعدادات الـ Webhook النشطة أو تهيئة التطبيق مجدداً
+    # الرابط الرئيسي المخصص لبنق الـ Cron Job دون لمس البوت أو إغلاق الـ Loop
     return "Bot Core Status: ALIVE & MONITORING", 200
 
 if __name__ == "__main__":
-    # عند تشغيل الكود لأول مرة يتم ربط الـ Webhook رسمياً تلقائياً
-    render_url = os.getenv("RENDER_EXTERNAL_URL")
-    if render_url:
-        asyncio.run(ptb_app.bot.set_webhook(url=f"{render_url}/{TOKEN}"))
-        
     app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 5000)))
