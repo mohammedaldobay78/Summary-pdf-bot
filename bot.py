@@ -1,11 +1,18 @@
+# =========================================================
+# IMPORTS
+# =========================================================
+
 import os
 import io
 import asyncio
 import datetime
 import traceback
+import logging
+
 from threading import Thread
 
 import requests
+
 from flask import Flask, request
 
 from google import genai
@@ -28,20 +35,39 @@ from telegram.ext import (
 )
 
 # =========================================================
-# 1. ENV
+# LOGGING
+# =========================================================
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+
+logger = logging.getLogger(__name__)
+
+# =========================================================
+# ENV VARIABLES
 # =========================================================
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
 BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
+
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 GOOGLE_API_KEY = os.getenv("GEMINI_API_KEY")
 
 ADMIN_ID = os.getenv("ADMIN_ID")
 
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
+
 PRIMARY_CHANNEL = "@Axia_Tech"
+
+# =========================================================
+# VALIDATION
+# =========================================================
 
 if not TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN missing")
@@ -49,25 +75,35 @@ if not TOKEN:
 if not GOOGLE_API_KEY:
     raise ValueError("GEMINI_API_KEY missing")
 
+if not SUPABASE_URL:
+    raise ValueError("SUPABASE_URL missing")
+
+if not SUPABASE_KEY:
+    raise ValueError("SUPABASE_KEY missing")
+
 # =========================================================
-# 2. APPS
+# APPS
 # =========================================================
 
 app = Flask(__name__)
 
-ai_client = genai.Client(api_key=GOOGLE_API_KEY)
+ai_client = genai.Client(
+    api_key=GOOGLE_API_KEY
+)
 
 ptb_app = Application.builder().token(TOKEN).build()
 
 # =========================================================
-# 3. ASYNC LOOP FIX
+# ASYNC LOOP
 # =========================================================
 
 bot_loop = asyncio.new_event_loop()
 
 
 def start_background_loop(loop):
+
     asyncio.set_event_loop(loop)
+
     loop.run_forever()
 
 
@@ -78,16 +114,16 @@ Thread(
 ).start()
 
 # =========================================================
-# 4. DATABASE
+# DATABASE
 # =========================================================
 
 def db_request(
     method,
     table,
     params=None,
-    json_data=None,
-    custom_headers=None
+    json_data=None
 ):
+
     url = f"{SUPABASE_URL}/rest/v1/{table}"
 
     headers = {
@@ -97,12 +133,10 @@ def db_request(
         "Prefer": "return=representation"
     }
 
-    if custom_headers:
-        headers.update(custom_headers)
-
     try:
 
         if method == "GET":
+
             res = requests.get(
                 url,
                 headers=headers,
@@ -111,6 +145,7 @@ def db_request(
             )
 
         elif method == "POST":
+
             res = requests.post(
                 url,
                 headers=headers,
@@ -119,6 +154,7 @@ def db_request(
             )
 
         elif method == "PATCH":
+
             res = requests.patch(
                 url,
                 headers=headers,
@@ -128,22 +164,27 @@ def db_request(
             )
 
         else:
+
             return []
 
         if res.status_code in [200, 201]:
+
             return res.json()
 
-        print("SUPABASE ERROR:", res.text)
+        logger.error(f"SUPABASE ERROR: {res.text}")
+
         return []
 
     except Exception as e:
-        print("DB ERROR:", e)
+
+        logger.error(f"DB ERROR: {e}")
+
         traceback.print_exc()
+
         return []
 
-
 # =========================================================
-# 5. USERS
+# USERS
 # =========================================================
 
 async def get_or_create_user(
@@ -151,51 +192,25 @@ async def get_or_create_user(
     context: ContextTypes.DEFAULT_TYPE,
     referrer_id=None
 ):
+
     user_id = str(tg_user.id)
 
     data = db_request(
         "GET",
         "users",
-        params={"user_id": f"eq.{user_id}"}
+        params={
+            "user_id": f"eq.{user_id}"
+        }
     )
 
     if not data:
-
-        if referrer_id and referrer_id != user_id:
-
-            ref_data = db_request(
-                "GET",
-                "users",
-                params={"user_id": f"eq.{referrer_id}"}
-            )
-
-            if ref_data:
-
-                current_points = ref_data[0]["points"]
-
-                db_request(
-                    "PATCH",
-                    "users",
-                    params={"user_id": f"eq.{referrer_id}"},
-                    json_data={
-                        "points": current_points + 2
-                    }
-                )
-
-                try:
-                    await context.bot.send_message(
-                        chat_id=int(referrer_id),
-                        text="🎉 مستخدم جديد سجل عبر رابط الإحالة الخاص بك.\n\nتم إضافة 2 نقطة إلى رصيدك."
-                    )
-                except:
-                    pass
 
         new_user = {
             "user_id": user_id,
             "username": tg_user.username or "",
             "points": 0,
             "last_daily_gift": "1970-01-01",
-            "referred_by": referrer_id if referrer_id else None
+            "referred_by": referrer_id
         }
 
         db_request(
@@ -204,7 +219,7 @@ async def get_or_create_user(
             json_data=new_user
         )
 
-        new_limits = {
+        limits = {
             "user_id": user_id,
             "last_reset": str(datetime.date.today()),
             "pdf_count": 0,
@@ -217,17 +232,22 @@ async def get_or_create_user(
         db_request(
             "POST",
             "daily_limits",
-            json_data=new_limits
+            json_data=limits
         )
 
         data = db_request(
             "GET",
             "users",
-            params={"user_id": f"eq.{user_id}"}
+            params={
+                "user_id": f"eq.{user_id}"
+            }
         )
 
     return data[0]
 
+# =========================================================
+# LIMITS
+# =========================================================
 
 def check_and_reset_limits(user_id):
 
@@ -236,12 +256,14 @@ def check_and_reset_limits(user_id):
     data = db_request(
         "GET",
         "daily_limits",
-        params={"user_id": f"eq.{user_id}"}
+        params={
+            "user_id": f"eq.{user_id}"
+        }
     )
 
     if not data:
 
-        new_limits = {
+        limits = {
             "user_id": user_id,
             "last_reset": today,
             "pdf_count": 0,
@@ -254,16 +276,16 @@ def check_and_reset_limits(user_id):
         db_request(
             "POST",
             "daily_limits",
-            json_data=new_limits
+            json_data=limits
         )
 
-        return new_limits
+        return limits
 
-    limit_row = data[0]
+    row = data[0]
 
-    if limit_row["last_reset"] != today:
+    if row["last_reset"] != today:
 
-        updated = {
+        reset_data = {
             "last_reset": today,
             "pdf_count": 0,
             "translate_count": 0,
@@ -275,29 +297,21 @@ def check_and_reset_limits(user_id):
         db_request(
             "PATCH",
             "daily_limits",
-            params={"user_id": f"eq.{user_id}"},
-            json_data=updated
+            params={
+                "user_id": f"eq.{user_id}"
+            },
+            json_data=reset_data
         )
 
-        data = db_request(
-            "GET",
-            "daily_limits",
-            params={"user_id": f"eq.{user_id}"}
-        )
+        row.update(reset_data)
 
-        return data[0]
-
-    return limit_row
-
+    return row
 
 # =========================================================
-# 6. CHANNEL CHECK
+# SUBSCRIPTION CHECK
 # =========================================================
 
 async def is_subscribed(bot, user_id):
-
-    if ADMIN_ID and str(user_id) == str(ADMIN_ID):
-        return True
 
     try:
 
@@ -307,17 +321,19 @@ async def is_subscribed(bot, user_id):
         )
 
         if member.status in ["left", "kicked"]:
+
             return False
 
         return True
 
     except Exception as e:
-        print("SUB CHECK ERROR:", e)
+
+        logger.error(f"SUB CHECK ERROR: {e}")
+
         return False
 
-
 # =========================================================
-# 7. MENUS
+# MENUS
 # =========================================================
 
 def services_menu_keyboard():
@@ -365,15 +381,17 @@ def services_menu_keyboard():
 
     return InlineKeyboardMarkup(keyboard)
 
-
 # =========================================================
-# 8. START
+# START
 # =========================================================
 
 async def cmd_start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
+    if not update.message:
+        return
 
     user_id = str(update.effective_user.id)
 
@@ -387,9 +405,10 @@ async def cmd_start(
         referrer_id
     )
 
-    context.user_data["awaiting_input"] = None
-
-    if not await is_subscribed(context.bot, user_id):
+    if not await is_subscribed(
+        context.bot,
+        user_id
+    ):
 
         keyboard = [[
             InlineKeyboardButton(
@@ -405,14 +424,15 @@ async def cmd_start(
 
         return
 
+    context.user_data["awaiting_input"] = None
+
     await update.message.reply_text(
         "👋 أهلاً بك في بوت الخدمات الذكي.\n\nاختر الخدمة المطلوبة:",
         reply_markup=services_menu_keyboard()
     )
 
-
 # =========================================================
-# 9. CALLBACKS
+# CALLBACKS
 # =========================================================
 
 async def handle_callbacks(
@@ -421,6 +441,9 @@ async def handle_callbacks(
 ):
 
     query = update.callback_query
+
+    if not query:
+        return
 
     await query.answer()
 
@@ -432,13 +455,13 @@ async def handle_callbacks(
 
         context.user_data["awaiting_input"] = service
 
-        texts = {
+        messages = {
 
             "pdf":
-                "📄 أرسل ملف PDF ليتم تلخيصه باحترافية.",
+                "📄 أرسل ملف PDF الآن.",
 
             "voice":
-                "🎙️ أرسل الملف الصوتي ليتم تفريغه بدقة.",
+                "🎙️ أرسل الملف الصوتي الآن.",
 
             "translate":
                 "🌐 أرسل النص المطلوب ترجمته.",
@@ -447,10 +470,12 @@ async def handle_callbacks(
                 "📊 أرسل موضوع الإنفوجرافيك.",
 
             "mind":
-                "🧠 أرسل الفكرة لإنشاء مخطط ذهني."
+                "🧠 أرسل فكرة المخطط الذهني."
         }
 
-        await query.edit_message_text(texts[service])
+        await query.edit_message_text(
+            messages[service]
+        )
 
     elif data == "my_account":
 
@@ -476,13 +501,18 @@ async def handle_callbacks(
 
 🎙️ صوت:
 {1 - limits['voice_count']}/1
+
+📊 إنفوجرافيك:
+{2 - limits['info_count']}/2
+
+🧠 مخطط ذهني:
+{2 - limits['mind_count']}/2
 """
 
         await query.edit_message_text(text)
 
-
 # =========================================================
-# 10. GEMINI HELPERS
+# GEMINI FILE WAIT
 # =========================================================
 
 async def wait_for_file_ready(file_obj):
@@ -497,9 +527,8 @@ async def wait_for_file_ready(file_obj):
 
     return file_obj
 
-
 # =========================================================
-# 11. PDF SUMMARY
+# PDF SUMMARY
 # =========================================================
 
 async def run_pdf_summary(
@@ -519,25 +548,18 @@ async def run_pdf_summary(
         )
 
         prompt = """
-قم بتحليل ملف الـ PDF بشكل احترافي ودقيق.
+قم بتحليل ملف PDF بدقة عالية.
 
 المطلوب:
 
-- استخراج الأفكار الرئيسية
-- كتابة ملخص منظم
-- تقسيم المحتوى إلى عناوين فرعية
+- استخراج الأفكار الأساسية
+- كتابة ملخص احترافي
+- تقسيم المحتوى بعناوين واضحة
 - إبراز أهم النقاط
 - تبسيط المعلومات المعقدة
 - الحفاظ على المعنى الأكاديمي
 
-صيغة الإخراج:
-
-1. عنوان المحتوى
-2. ملخص عام
-3. أهم النقاط
-4. الخلاصة النهائية
-
-استخدم أسلوباً واضحاً ومنظماً.
+استخدم تنسيقاً منظماً وواضحاً.
 """
 
         response = ai_client.models.generate_content(
@@ -557,7 +579,7 @@ async def run_pdf_summary(
 
     except Exception as e:
 
-        print("PDF ERROR:", e)
+        logger.error(f"PDF ERROR: {e}")
 
         traceback.print_exc()
 
@@ -573,9 +595,8 @@ async def run_pdf_summary(
         if os.path.exists(file_path):
             os.remove(file_path)
 
-
 # =========================================================
-# 12. VOICE TRANSCRIPTION
+# VOICE TRANSCRIPTION
 # =========================================================
 
 async def run_voice_transcription(
@@ -595,18 +616,16 @@ async def run_voice_transcription(
         )
 
         prompt = """
-قم بتحويل الملف الصوتي إلى نص احترافي ودقيق.
+قم بتحويل الملف الصوتي إلى نص مكتوب باحترافية.
 
 المطلوب:
 
 - تفريغ الكلام كاملاً
-- تصحيح الأخطاء اللغوية إن وجدت
+- تصحيح الأخطاء اللغوية
 - إزالة التكرار غير الضروري
 - تنسيق النص بشكل مرتب
-- تقسيم الفقرات حسب الموضوع
+- تقسيم الفقرات
 - الحفاظ على المعنى الأصلي
-
-إذا كان الصوت غير واضح فقم بتقدير النص بأفضل شكل ممكن.
 """
 
         response = ai_client.models.generate_content(
@@ -626,7 +645,7 @@ async def run_voice_transcription(
 
     except Exception as e:
 
-        print("VOICE ERROR:", e)
+        logger.error(f"VOICE ERROR: {e}")
 
         traceback.print_exc()
 
@@ -642,9 +661,8 @@ async def run_voice_transcription(
         if os.path.exists(file_path):
             os.remove(file_path)
 
-
 # =========================================================
-# 13. TRANSLATION
+# TRANSLATION
 # =========================================================
 
 async def run_text_translation(
@@ -656,15 +674,14 @@ async def run_text_translation(
     try:
 
         prompt = f"""
-قم بترجمة النص التالي ترجمة احترافية عالية الجودة.
+قم بترجمة النص التالي ترجمة احترافية دقيقة.
 
 المطلوب:
 
-- ترجمة دقيقة
-- الحفاظ على المعنى والسياق
+- الحفاظ على المعنى
+- تحسين الصياغة
 - استخدام لغة أكاديمية واضحة
-- تحسين الصياغة عند الحاجة
-- عدم الترجمة الحرفية إذا أضرت بالمعنى
+- تجنب الترجمة الحرفية
 
 النص:
 
@@ -685,7 +702,7 @@ async def run_text_translation(
 
     except Exception as e:
 
-        print("TRANSLATION ERROR:", e)
+        logger.error(f"TRANSLATION ERROR: {e}")
 
         traceback.print_exc()
 
@@ -696,9 +713,8 @@ async def run_text_translation(
 
         return False
 
-
 # =========================================================
-# 14. IMAGE GENERATION
+# IMAGE GENERATION
 # =========================================================
 
 async def run_generate_image(
@@ -710,30 +726,29 @@ async def run_generate_image(
 
     try:
 
-        final_prompt = f"""
-Create a professional high-quality {image_type}.
+        prompt = f"""
+Create a premium quality professional {image_type}.
 
 Topic:
 {prompt_text}
 
 Requirements:
-- Modern clean design
+
+- Modern design
+- Clean layout
 - Professional typography
-- Structured layout
-- Attractive visual hierarchy
-- Detailed informative content
 - High readability
-- Premium style
-- Balanced colors
-- Minimal clutter
-- 16:9 composition
+- Structured visual hierarchy
+- Attractive composition
+- Detailed informative content
+- 16:9 aspect ratio
 """
 
-        res = ai_client.models.generate_images(
+        result = ai_client.models.generate_images(
 
             model="imagen-3.0-generate-002",
 
-            prompt=final_prompt,
+            prompt=prompt,
 
             config=types.GenerateImagesConfig(
                 number_of_images=1,
@@ -742,12 +757,12 @@ Requirements:
             )
         )
 
-        for img in res.generated_images:
+        for image in result.generated_images:
 
             await bot.send_photo(
                 chat_id=chat_id,
                 photo=io.BytesIO(
-                    img.image.image_bytes
+                    image.image.image_bytes
                 )
             )
 
@@ -755,7 +770,7 @@ Requirements:
 
     except Exception as e:
 
-        print("IMAGE ERROR:", e)
+        logger.error(f"IMAGE ERROR: {e}")
 
         traceback.print_exc()
 
@@ -766,9 +781,8 @@ Requirements:
 
         return False
 
-
 # =========================================================
-# 15. BILLING ENGINE
+# BILLING
 # =========================================================
 
 async def process_billing_and_run(
@@ -810,7 +824,9 @@ async def process_billing_and_run(
             db_request(
                 "PATCH",
                 "daily_limits",
-                params={"user_id": f"eq.{user_id}"},
+                params={
+                    "user_id": f"eq.{user_id}"
+                },
                 json_data={
                     service_key: used + 1
                 }
@@ -845,7 +861,9 @@ async def process_billing_and_run(
             db_request(
                 "PATCH",
                 "users",
-                params={"user_id": f"eq.{user_id}"},
+                params={
+                    "user_id": f"eq.{user_id}"
+                },
                 json_data={
                     "points": user["points"] - points_cost
                 }
@@ -853,9 +871,8 @@ async def process_billing_and_run(
 
         await msg.delete()
 
-
 # =========================================================
-# 16. HANDLERS
+# DOCUMENTS
 # =========================================================
 
 async def handle_docs(
@@ -863,67 +880,115 @@ async def handle_docs(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
+    if not update.message:
+        return
+
+    if not update.message.document:
+        return
+
     if context.user_data.get("awaiting_input") != "pdf":
         return
 
-    file = await context.bot.get_file(
-        update.message.document.file_id
-    )
+    try:
 
-    file_path = f"temp_{update.message.document.file_name}"
+        file = await context.bot.get_file(
+            update.message.document.file_id
+        )
 
-    await file.download_to_drive(file_path)
+        file_path = (
+            f"temp_{update.message.document.file_name}"
+        )
 
-    await process_billing_and_run(
-        update,
-        context,
-        "pdf_count",
-        3,
-        3,
-        run_pdf_summary,
-        file_path
-    )
+        await file.download_to_drive(file_path)
 
-    context.user_data["awaiting_input"] = None
+        await process_billing_and_run(
+            update,
+            context,
+            "pdf_count",
+            3,
+            3,
+            run_pdf_summary,
+            file_path
+        )
 
+    except Exception as e:
+
+        logger.error(f"PDF HANDLER ERROR: {e}")
+
+        traceback.print_exc()
+
+    finally:
+
+        context.user_data["awaiting_input"] = None
+
+# =========================================================
+# AUDIO
+# =========================================================
 
 async def handle_audio(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
+    if not update.message:
+        return
+
     if context.user_data.get("awaiting_input") != "voice":
         return
 
-    file_id = (
-        update.message.voice.file_id
-        if update.message.voice
-        else update.message.audio.file_id
-    )
+    try:
 
-    file = await context.bot.get_file(file_id)
+        file_id = None
 
-    file_path = f"temp_{file_id}.ogg"
+        if update.message.voice:
+            file_id = update.message.voice.file_id
 
-    await file.download_to_drive(file_path)
+        elif update.message.audio:
+            file_id = update.message.audio.file_id
 
-    await process_billing_and_run(
-        update,
-        context,
-        "voice_count",
-        1,
-        2,
-        run_voice_transcription,
-        file_path
-    )
+        else:
+            return
 
-    context.user_data["awaiting_input"] = None
+        file = await context.bot.get_file(file_id)
 
+        file_path = f"temp_{file_id}.ogg"
+
+        await file.download_to_drive(file_path)
+
+        await process_billing_and_run(
+            update,
+            context,
+            "voice_count",
+            1,
+            2,
+            run_voice_transcription,
+            file_path
+        )
+
+    except Exception as e:
+
+        logger.error(f"AUDIO HANDLER ERROR: {e}")
+
+        traceback.print_exc()
+
+    finally:
+
+        context.user_data["awaiting_input"] = None
+
+# =========================================================
+# TEXT REQUESTS
+# =========================================================
 
 async def handle_text_requests(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
+    if not update.message:
+        return
+
+    if not update.message.text:
+        return
 
     text = update.message.text.strip()
 
@@ -972,23 +1037,55 @@ async def handle_text_requests(
     else:
 
         await update.message.reply_text(
-            "اختر الخدمة أولاً.",
+            "👇 اختر الخدمة أولاً.",
             reply_markup=services_menu_keyboard()
         )
 
     context.user_data["awaiting_input"] = None
 
+# =========================================================
+# ERROR HANDLER
+# =========================================================
+
+async def error_handler(
+    update,
+    context
+):
+
+    logger.error(
+        msg="Unhandled exception",
+        exc_info=context.error
+    )
+
+    traceback.print_exc()
+
+    try:
+
+        if update and update.effective_chat:
+
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="❌ حدث خطأ داخلي أثناء تنفيذ الطلب."
+            )
+
+    except:
+        pass
 
 # =========================================================
-# 17. REGISTER
+# REGISTER HANDLERS
 # =========================================================
 
 ptb_app.add_handler(
-    CommandHandler("start", cmd_start)
+    CommandHandler(
+        "start",
+        cmd_start
+    )
 )
 
 ptb_app.add_handler(
-    CallbackQueryHandler(handle_callbacks)
+    CallbackQueryHandler(
+        handle_callbacks
+    )
 )
 
 ptb_app.add_handler(
@@ -1012,11 +1109,15 @@ ptb_app.add_handler(
     )
 )
 
+ptb_app.add_error_handler(
+    error_handler
+)
+
 # =========================================================
-# 18. WEBHOOK
+# WEBHOOK
 # =========================================================
 
-def setup_webhook_sync():
+def setup_webhook():
 
     asyncio.run_coroutine_threadsafe(
         ptb_app.initialize(),
@@ -1028,58 +1129,71 @@ def setup_webhook_sync():
         bot_loop
     ).result()
 
-    render_url = os.getenv(
-        "RENDER_EXTERNAL_URL"
-    )
+    if RENDER_EXTERNAL_URL:
 
-    if render_url:
+        webhook_url = (
+            f"{RENDER_EXTERNAL_URL}/{TOKEN}"
+        )
 
         asyncio.run_coroutine_threadsafe(
-
             ptb_app.bot.set_webhook(
-                url=f"{render_url}/{TOKEN}"
+                url=webhook_url
             ),
-
             bot_loop
-
         ).result()
 
+        logger.info("Webhook configured")
 
-setup_webhook_sync()
+setup_webhook()
 
 # =========================================================
-# 19. FLASK
+# FLASK ROUTES
 # =========================================================
 
-@app.route(f"/{TOKEN}", methods=["POST"])
+@app.route(
+    f"/{TOKEN}",
+    methods=["POST"]
+)
 def telegram_webhook():
 
-    update = Update.de_json(
-        request.get_json(force=True),
-        ptb_app.bot
-    )
+    try:
 
-    asyncio.run_coroutine_threadsafe(
-        ptb_app.process_update(update),
-        bot_loop
-    )
+        data = request.get_json(force=True)
 
-    return "OK", 200
+        update = Update.de_json(
+            data,
+            ptb_app.bot
+        )
 
+        asyncio.run_coroutine_threadsafe(
+            ptb_app.process_update(update),
+            bot_loop
+        )
+
+        return "OK", 200
+
+    except Exception as e:
+
+        logger.error(f"WEBHOOK ERROR: {e}")
+
+        traceback.print_exc()
+
+        return "ERROR", 500
 
 @app.route("/")
-def health():
+def home():
 
     return "BOT RUNNING", 200
 
-
 # =========================================================
-# 20. RUN
+# MAIN
 # =========================================================
 
 if __name__ == "__main__":
 
     app.run(
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 5000))
+        port=int(
+            os.environ.get("PORT", 5000)
+        )
     )
