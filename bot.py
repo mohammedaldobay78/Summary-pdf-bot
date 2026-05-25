@@ -22,6 +22,8 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
     User,
 )
 
@@ -55,7 +57,7 @@ BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
 
 GOOGLE_API_KEY = os.getenv("GEMINI_API_KEY")
 
@@ -79,7 +81,7 @@ if not SUPABASE_URL:
     raise ValueError("SUPABASE_URL missing")
 
 if not SUPABASE_KEY:
-    raise ValueError("SUPABASE_KEY missing")
+    raise ValueError("SUPABASE_SERVICE_KEY missing")
 
 # =========================================================
 # APPS
@@ -169,7 +171,10 @@ def db_request(
 
         if res.status_code in [200, 201]:
 
-            return res.json()
+            try:
+                return res.json()
+            except:
+                return []
 
         logger.error(f"SUPABASE ERROR: {res.text}")
 
@@ -203,30 +208,52 @@ async def get_or_create_user(
         }
     )
 
-    if not data:
+    if data:
 
-        new_user = {
+        return data[0]
+
+    new_user = {
+        "user_id": user_id,
+        "username": tg_user.username or "",
+        "points": 0,
+        "last_daily_gift": "1970-01-01"
+    }
+
+    # لا تضيف referred_by إلا إذا كان العمود موجود
+    if referrer_id:
+        new_user["referred_by"] = referrer_id
+
+    create_result = db_request(
+        "POST",
+        "users",
+        json_data=new_user
+    )
+
+    if not create_result:
+
+        logger.error("FAILED TO CREATE USER")
+
+        return {
             "user_id": user_id,
-            "username": tg_user.username or "",
-            "points": 0,
-            "last_daily_gift": "1970-01-01",
-            "referred_by": referrer_id
+            "points": 0
         }
 
-        db_request(
-            "POST",
-            "users",
-            json_data=new_user
-        )
+    limits_data = db_request(
+        "GET",
+        "daily_limits",
+        params={
+            "user_id": f"eq.{user_id}"
+        }
+    )
+
+    if not limits_data:
 
         limits = {
             "user_id": user_id,
             "last_reset": str(datetime.date.today()),
             "pdf_count": 0,
             "translate_count": 0,
-            "voice_count": 0,
-            "info_count": 0,
-            "mind_count": 0
+            "voice_count": 0
         }
 
         db_request(
@@ -235,15 +262,21 @@ async def get_or_create_user(
             json_data=limits
         )
 
-        data = db_request(
-            "GET",
-            "users",
-            params={
-                "user_id": f"eq.{user_id}"
-            }
-        )
+    data = db_request(
+        "GET",
+        "users",
+        params={
+            "user_id": f"eq.{user_id}"
+        }
+    )
 
-    return data[0]
+    if data:
+        return data[0]
+
+    return {
+        "user_id": user_id,
+        "points": 0
+    }
 
 # =========================================================
 # LIMITS
@@ -268,9 +301,7 @@ def check_and_reset_limits(user_id):
             "last_reset": today,
             "pdf_count": 0,
             "translate_count": 0,
-            "voice_count": 0,
-            "info_count": 0,
-            "mind_count": 0
+            "voice_count": 0
         }
 
         db_request(
@@ -289,9 +320,7 @@ def check_and_reset_limits(user_id):
             "last_reset": today,
             "pdf_count": 0,
             "translate_count": 0,
-            "voice_count": 0,
-            "info_count": 0,
-            "mind_count": 0
+            "voice_count": 0
         }
 
         db_request(
@@ -336,6 +365,19 @@ async def is_subscribed(bot, user_id):
 # MENUS
 # =========================================================
 
+def main_menu():
+
+    keyboard = [
+        ["📄 تلخيص PDF", "🎙️ تفريغ صوت"],
+        ["🌐 ترجمة"],
+        ["👤 حسابي"]
+    ]
+
+    return ReplyKeyboardMarkup(
+        keyboard,
+        resize_keyboard=True
+    )
+
 def services_menu_keyboard():
 
     keyboard = [
@@ -356,18 +398,6 @@ def services_menu_keyboard():
             InlineKeyboardButton(
                 "🌐 ترجمة",
                 callback_data="srv_translate"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "📊 إنفوجرافيك",
-                callback_data="srv_info"
-            ),
-
-            InlineKeyboardButton(
-                "🧠 مخطط ذهني",
-                callback_data="srv_mind"
             )
         ],
 
@@ -427,89 +457,75 @@ async def cmd_start(
     context.user_data["awaiting_input"] = None
 
     await update.message.reply_text(
-        "👋 أهلاً بك في بوت الخدمات الذكي.\n\nاختر الخدمة المطلوبة:",
-        reply_markup=services_menu_keyboard()
+        "👋 أهلاً بك في بوت الخدمات الذكي.",
+        reply_markup=main_menu()
     )
 
 # =========================================================
-# CALLBACKS
+# MENU HANDLER
 # =========================================================
 
-async def handle_callbacks(
+async def menu_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    query = update.callback_query
-
-    if not query:
+    if not update.message:
         return
 
-    await query.answer()
+    text = update.message.text
 
-    data = query.data
+    if text == "📄 تلخيص PDF":
 
-    if data.startswith("srv_"):
+        context.user_data["awaiting_input"] = "pdf"
 
-        service = data.split("_")[1]
-
-        context.user_data["awaiting_input"] = service
-
-        messages = {
-
-            "pdf":
-                "📄 أرسل ملف PDF الآن.",
-
-            "voice":
-                "🎙️ أرسل الملف الصوتي الآن.",
-
-            "translate":
-                "🌐 أرسل النص المطلوب ترجمته.",
-
-            "info":
-                "📊 أرسل موضوع الإنفوجرافيك.",
-
-            "mind":
-                "🧠 أرسل فكرة المخطط الذهني."
-        }
-
-        await query.edit_message_text(
-            messages[service]
+        await update.message.reply_text(
+            "📄 أرسل ملف PDF الآن."
         )
 
-    elif data == "my_account":
+    elif text == "🎙️ تفريغ صوت":
+
+        context.user_data["awaiting_input"] = "voice"
+
+        await update.message.reply_text(
+            "🎙️ أرسل الملف الصوتي الآن."
+        )
+
+    elif text == "🌐 ترجمة":
+
+        context.user_data["awaiting_input"] = "translate"
+
+        await update.message.reply_text(
+            "🌐 أرسل النص المطلوب ترجمته."
+        )
+
+    elif text == "👤 حسابي":
 
         user = await get_or_create_user(
-            query.from_user,
+            update.effective_user,
             context
         )
 
         limits = check_and_reset_limits(
-            str(query.from_user.id)
+            str(update.effective_user.id)
         )
 
         text = f"""
 👤 حسابك
 
-🪙 النقاط: {user['points']}
+🪙 النقاط: {user.get('points', 0)}
 
 📄 PDF:
-{3 - limits['pdf_count']}/3
+{3 - limits.get('pdf_count', 0)}/3
 
 🌐 ترجمة:
-{3 - limits['translate_count']}/3
+{3 - limits.get('translate_count', 0)}/3
 
 🎙️ صوت:
-{1 - limits['voice_count']}/1
-
-📊 إنفوجرافيك:
-{2 - limits['info_count']}/2
-
-🧠 مخطط ذهني:
-{2 - limits['mind_count']}/2
+{1 - limits.get('voice_count', 0)}/1
 """
 
-        await query.edit_message_text(text)
+        await update.message.reply_text(text)
 
 # =========================================================
 # GEMINI FILE WAIT
@@ -557,9 +573,6 @@ async def run_pdf_summary(
 - تقسيم المحتوى بعناوين واضحة
 - إبراز أهم النقاط
 - تبسيط المعلومات المعقدة
-- الحفاظ على المعنى الأكاديمي
-
-استخدم تنسيقاً منظماً وواضحاً.
 """
 
         response = ai_client.models.generate_content(
@@ -617,15 +630,6 @@ async def run_voice_transcription(
 
         prompt = """
 قم بتحويل الملف الصوتي إلى نص مكتوب باحترافية.
-
-المطلوب:
-
-- تفريغ الكلام كاملاً
-- تصحيح الأخطاء اللغوية
-- إزالة التكرار غير الضروري
-- تنسيق النص بشكل مرتب
-- تقسيم الفقرات
-- الحفاظ على المعنى الأصلي
 """
 
         response = ai_client.models.generate_content(
@@ -674,16 +678,7 @@ async def run_text_translation(
     try:
 
         prompt = f"""
-قم بترجمة النص التالي ترجمة احترافية دقيقة.
-
-المطلوب:
-
-- الحفاظ على المعنى
-- تحسين الصياغة
-- استخدام لغة أكاديمية واضحة
-- تجنب الترجمة الحرفية
-
-النص:
+قم بترجمة النص التالي ترجمة احترافية:
 
 {text_content}
 """
@@ -714,74 +709,6 @@ async def run_text_translation(
         return False
 
 # =========================================================
-# IMAGE GENERATION
-# =========================================================
-
-async def run_generate_image(
-    bot,
-    chat_id,
-    prompt_text,
-    image_type
-):
-
-    try:
-
-        prompt = f"""
-Create a premium quality professional {image_type}.
-
-Topic:
-{prompt_text}
-
-Requirements:
-
-- Modern design
-- Clean layout
-- Professional typography
-- High readability
-- Structured visual hierarchy
-- Attractive composition
-- Detailed informative content
-- 16:9 aspect ratio
-"""
-
-        result = ai_client.models.generate_images(
-
-            model="imagen-3.0-generate-002",
-
-            prompt=prompt,
-
-            config=types.GenerateImagesConfig(
-                number_of_images=1,
-                output_mime_type="image/jpeg",
-                aspect_ratio="16:9"
-            )
-        )
-
-        for image in result.generated_images:
-
-            await bot.send_photo(
-                chat_id=chat_id,
-                photo=io.BytesIO(
-                    image.image.image_bytes
-                )
-            )
-
-        return True
-
-    except Exception as e:
-
-        logger.error(f"IMAGE ERROR: {e}")
-
-        traceback.print_exc()
-
-        await bot.send_message(
-            chat_id=chat_id,
-            text="❌ فشل توليد الصورة."
-        )
-
-        return False
-
-# =========================================================
 # BILLING
 # =========================================================
 
@@ -804,7 +731,7 @@ async def process_billing_and_run(
 
     limits = check_and_reset_limits(user_id)
 
-    used = limits[service_key]
+    used = limits.get(service_key, 0)
 
     if used < free_limit:
 
@@ -836,7 +763,7 @@ async def process_billing_and_run(
 
     else:
 
-        if user["points"] < points_cost:
+        if user.get("points", 0) < points_cost:
 
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
@@ -891,13 +818,21 @@ async def handle_docs(
 
     try:
 
-        file = await context.bot.get_file(
-            update.message.document.file_id
+        document = update.message.document
+
+        safe_name = "".join(
+            c for c in document.file_name
+            if c.isascii()
         )
 
-        file_path = (
-            f"temp_{update.message.document.file_name}"
+        if not safe_name.endswith(".pdf"):
+            safe_name = "file.pdf"
+
+        file = await context.bot.get_file(
+            document.file_id
         )
+
+        file_path = f"temp_{safe_name}"
 
         await file.download_to_drive(file_path)
 
@@ -1008,40 +943,7 @@ async def handle_text_requests(
             text
         )
 
-    elif awaiting == "info":
-
-        await process_billing_and_run(
-            update,
-            context,
-            "info_count",
-            2,
-            5,
-            run_generate_image,
-            text,
-            "infographic"
-        )
-
-    elif awaiting == "mind":
-
-        await process_billing_and_run(
-            update,
-            context,
-            "mind_count",
-            2,
-            5,
-            run_generate_image,
-            text,
-            "mind map"
-        )
-
-    else:
-
-        await update.message.reply_text(
-            "👇 اختر الخدمة أولاً.",
-            reply_markup=services_menu_keyboard()
-        )
-
-    context.user_data["awaiting_input"] = None
+        context.user_data["awaiting_input"] = None
 
 # =========================================================
 # ERROR HANDLER
@@ -1077,123 +979,3 @@ async def error_handler(
 
 ptb_app.add_handler(
     CommandHandler(
-        "start",
-        cmd_start
-    )
-)
-
-ptb_app.add_handler(
-    CallbackQueryHandler(
-        handle_callbacks
-    )
-)
-
-ptb_app.add_handler(
-    MessageHandler(
-        filters.Document.PDF,
-        handle_docs
-    )
-)
-
-ptb_app.add_handler(
-    MessageHandler(
-        filters.VOICE | filters.AUDIO,
-        handle_audio
-    )
-)
-
-ptb_app.add_handler(
-    MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        handle_text_requests
-    )
-)
-
-ptb_app.add_error_handler(
-    error_handler
-)
-
-# =========================================================
-# WEBHOOK
-# =========================================================
-
-def setup_webhook():
-
-    asyncio.run_coroutine_threadsafe(
-        ptb_app.initialize(),
-        bot_loop
-    ).result()
-
-    asyncio.run_coroutine_threadsafe(
-        ptb_app.start(),
-        bot_loop
-    ).result()
-
-    if RENDER_EXTERNAL_URL:
-
-        webhook_url = (
-            f"{RENDER_EXTERNAL_URL}/{TOKEN}"
-        )
-
-        asyncio.run_coroutine_threadsafe(
-            ptb_app.bot.set_webhook(
-                url=webhook_url
-            ),
-            bot_loop
-        ).result()
-
-        logger.info("Webhook configured")
-
-setup_webhook()
-
-# =========================================================
-# FLASK ROUTES
-# =========================================================
-
-@app.route(
-    f"/{TOKEN}",
-    methods=["POST"]
-)
-def telegram_webhook():
-
-    try:
-
-        data = request.get_json(force=True)
-
-        update = Update.de_json(
-            data,
-            ptb_app.bot
-        )
-
-        asyncio.run_coroutine_threadsafe(
-            ptb_app.process_update(update),
-            bot_loop
-        )
-
-        return "OK", 200
-
-    except Exception as e:
-
-        logger.error(f"WEBHOOK ERROR: {e}")
-
-        traceback.print_exc()
-
-        return "ERROR", 500
-
-@app.route("/")
-def home():
-
-    return "BOT RUNNING", 200
-
-# =========================================================
-# MAIN
-# =========================================================
-
-if __name__ == "__main__":
-
-    app.run(
-        host="0.0.0.0",
-        port=int(
-            os.environ.get("PORT", 5000)
-        )
-    )
