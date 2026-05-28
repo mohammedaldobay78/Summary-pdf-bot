@@ -40,15 +40,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ضع معرفات حسابات الأدمن هنا (ID)
-ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "123456789").split(",")]
-
+ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "123456789").split(",") if id.strip()]
 PRIMARY_CHANNEL = "@Axia_Tech"
+
 DAILY_FREE_LIMITS = {
     "pdf_count": 3,
     "translate_count": 3,
     "voice_count": 1,
-    "image_count": 0 # لا يوجد مجاني للصور لتكلفتها
+    "image_count": 0 
 }
 POINTS_COSTS = {
     "pdf_count": 3,
@@ -57,7 +56,6 @@ POINTS_COSTS = {
     "image_count": 5
 }
 
-# باقات نجوم تلغرام (Stars: Points)
 STAR_PACKAGES = {
     "pkg_1": {"stars": 1, "points": 3, "title": "باقة البداية"},
     "pkg_2": {"stars": 10, "points": 30, "title": "الباقة الأساسية"},
@@ -66,7 +64,7 @@ STAR_PACKAGES = {
 }
 
 # =========================================================
-# ENV VALIDATION
+# MULTIPLE API KEYS MANAGER
 # =========================================================
 
 def get_env(key, default=None, required=True):
@@ -78,14 +76,49 @@ def get_env(key, default=None, required=True):
 TOKEN = get_env("TELEGRAM_BOT_TOKEN")
 SUPABASE_URL = get_env("SUPABASE_URL")
 SUPABASE_KEY = get_env("SUPABASE_KEY")
-GOOGLE_API_KEY = get_env("GEMINI_API_KEY")
 RENDER_EXTERNAL_URL = get_env("RENDER_EXTERNAL_URL")
 
-# =========================================================
-# CLIENTS
-# =========================================================
+# جلب المفاتيح المتعددة مفصولة بفاصلة
+RAW_KEYS = get_env("GEMINI_API_KEYS") # غيرنا اسم المتغير ليصبح جمعاً
+API_KEYS = [k.strip() for k in RAW_KEYS.split(",") if k.strip()]
+CURRENT_KEY_INDEX = 0
 
-ai_client = genai.Client(api_key=GOOGLE_API_KEY)
+if not API_KEYS:
+    raise ValueError("No Gemini API keys provided in GEMINI_API_KEYS")
+
+def get_current_ai_client():
+    """توليد عميل (Client) باستخدام المفتاح النشط حالياً"""
+    return genai.Client(api_key=API_KEYS[CURRENT_KEY_INDEX])
+
+async def execute_with_key_rotation(task_func, *args, **kwargs):
+    """
+    نظام ذكي لتجربة المفاتيح.
+    إذا انتهى رصيد المفتاح الحالي، ينتقل للمفتاح الذي يليه تلقائياً.
+    """
+    global CURRENT_KEY_INDEX
+    attempts = 0
+    max_attempts = len(API_KEYS)
+
+    while attempts < max_attempts:
+        client = get_current_ai_client()
+        try:
+            # تمرير العميل (Client) كأول متغير للدالة
+            return await task_func(client, *args, **kwargs)
+        except Exception as e:
+            error_msg = str(e).lower()
+            # التحقق إذا كان الخطأ بسبب انتهاء الحصة 429
+            if "429" in error_msg or "quota" in error_msg or "exhausted" in error_msg:
+                logger.warning(f"⚠️ API Key {CURRENT_KEY_INDEX + 1}/{len(API_KEYS)} Exhausted. Switching...")
+                CURRENT_KEY_INDEX = (CURRENT_KEY_INDEX + 1) % len(API_KEYS)
+                attempts += 1
+            else:
+                # إذا كان خطأ آخر (مثل ملف غير صالح) يتم إرجاعه فوراً
+                raise e
+    
+    # إذا لفت الدورة على كل المفاتيح وكلها منتهية
+    raise Exception("ALL_KEYS_EXHAUSTED")
+
+
 http_client: httpx.AsyncClient = None
 
 # =========================================================
@@ -106,14 +139,11 @@ async def db_request(method, table, params=None, json_data=None):
         )
         if response.status_code in [200, 201, 204]:
             return response.json() if response.text else []
-        logger.error(f"Supabase Error [{response.status_code}]: {response.text}")
         return []
-    except Exception as e:
-        logger.error(f"DB Error: {e}")
+    except Exception:
         return []
 
 async def update_points(user_id: str, amount: int):
-    """إضافة أو خصم نقاط بشكل مباشر"""
     user_data = await db_request("GET", "users", params={"user_id": f"eq.{user_id}"})
     if not user_data: return False
     new_points = max(0, user_data[0].get("points", 0) + amount)
@@ -124,10 +154,8 @@ async def get_or_init_user(tg_user: User, context: ContextTypes.DEFAULT_TYPE = N
     user_id = str(tg_user.id)
     data = await db_request("GET", "users", params={"user_id": f"eq.{user_id}"})
     
-    if data:
-        return data[0]
+    if data: return data[0]
 
-    # مستخدم جديد
     new_user = {
         "user_id": user_id,
         "username": tg_user.username or "Unknown",
@@ -136,19 +164,17 @@ async def get_or_init_user(tg_user: User, context: ContextTypes.DEFAULT_TYPE = N
     }
     created = await db_request("POST", "users", json_data=new_user)
     
-    # تهيئة حدود الاستخدام اليومي
     limits = {"user_id": user_id, "last_reset": str(datetime.date.today()), **{k: 0 for k in DAILY_FREE_LIMITS.keys()}}
     await db_request("POST", "daily_limits", json_data=limits)
     
-    # مكافأة الإحالة (نقطتين للمُحيل)
     if referrer_id and str(referrer_id) != user_id:
         await update_points(str(referrer_id), 2)
         if context:
             try:
                 await context.bot.send_message(
                     chat_id=int(referrer_id),
-                    text="🎉 قام صديقك بالتسجيل عبر رابطك! تمت إضافة `2` نقطة لحسابك.",
-                    parse_mode="Markdown"
+                    text="🎉 <b>تسجيل جديد!</b> قام صديقك بالتسجيل عبر رابطك وتمت إضافة <code>2</code> نقطة لحسابك.",
+                    parse_mode="HTML"
                 )
             except: pass
 
@@ -170,7 +196,7 @@ async def check_and_reset_limits(user_id):
     return row
 
 # =========================================================
-# MENUS & KEYBOARDS
+# MENUS
 # =========================================================
 
 def get_main_keyboard():
@@ -182,37 +208,32 @@ def get_main_keyboard():
     ], resize_keyboard=True)
 
 # =========================================================
-# AI CORE WORKERS
+# AI CORE WORKERS (Modified for Key Rotation)
 # =========================================================
 
-async def process_text_with_gemini(file_path=None, text=None, prompt=""):
+async def _task_process_text(client: genai.Client, file_path=None, text=None, prompt=""):
     if file_path:
-        uploaded_file = ai_client.files.upload(file=file_path)
+        uploaded_file = client.files.upload(file=file_path)
         while uploaded_file.state.name == "PROCESSING":
             await asyncio.sleep(2)
-            uploaded_file = ai_client.files.get(name=uploaded_file.name)
+            uploaded_file = client.files.get(name=uploaded_file.name)
         contents = [uploaded_file, prompt]
     else:
         contents = f"{prompt}\n\n{text}"
 
-    response = ai_client.models.generate_content(
-        model="gemini-2.0-flash",
+    response = client.models.generate_content(
+        model="gemini-1.5-flash",
         contents=contents
     )
     return response.text
 
-async def generate_infographic(file_path=None, text_content=None):
-    """
-    1. يقرأ النص/الملف ويستخرج النقاط الرئيسية كـ 'وصف للصورة'
-    2. يرسل الوصف إلى نموذج Imagen 3 لتوليد الإنفوجرافيك
-    """
-    extract_prompt = "اكتب وصفاً مفصلاً باللغة الإنجليزية (Prompt) لتصميم إنفوجرافيك احترافي يلخص المعلومات التالية. الوصف يجب أن يركز على الألوان، الأيقونات، التوزيع البصري ولا يحتوي على نصوص معقدة، فقط عناوين رئيسية: "
+async def _task_generate_info(client: genai.Client, file_path=None, text_content=None):
+    extract_prompt = "اكتب وصفاً مفصلاً باللغة الإنجليزية (Prompt) لتصميم إنفوجرافيك احترافي. ركز على الألوان والأيقونات بدون نصوص معقدة:"
     
-    # 1. استخراج فكرة التصميم (Prompt)
-    image_prompt = await process_text_with_gemini(file_path, text_content, extract_prompt)
+    # استخراج الوصف باستخدام الموديل العادي عبر نفس العميل
+    image_prompt = await _task_process_text(client, file_path, text_content, extract_prompt)
     
-    # 2. توليد الصورة
-    result = ai_client.models.generate_images(
+    result = client.models.generate_images(
         model='imagen-3.0-generate-001',
         prompt=f"Professional infographic vector art, clean design, highly detailed, modern flat style, 8k resolution. {image_prompt}",
         config=types.GenerateImagesConfig(
@@ -223,8 +244,15 @@ async def generate_infographic(file_path=None, text_content=None):
     )
     return result.generated_images[0].image.image_bytes
 
+# دوال التغليف (Wrappers) التي تنادي نظام تبديل المفاتيح
+async def process_text_with_gemini(file_path=None, text=None, prompt=""):
+    return await execute_with_key_rotation(_task_process_text, file_path=file_path, text=text, prompt=prompt)
+
+async def generate_infographic(file_path=None, text_content=None):
+    return await execute_with_key_rotation(_task_generate_info, file_path=file_path, text_content=text_content)
+
 # =========================================================
-# TELEGRAM HANDLERS: START & MENU
+# TELEGRAM HANDLERS
 # =========================================================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -232,7 +260,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     referrer = context.args[0] if context.args else None
     await get_or_init_user(user, context, referrer)
 
-    # التحقق من الاشتراك
     try:
         member = await context.bot.get_chat_member(PRIMARY_CHANNEL, user.id)
         if member.status in ["left", "kicked"]:
@@ -255,34 +282,30 @@ async def menu_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = await get_or_init_user(update.effective_user)
         limits = await check_and_reset_limits(user_id)
         msg = (
-            f"👤 **معلومات حسابك**\n"
-            f"🆔 الآيدي: `{user_id}`\n"
-            f"🪙 رصيد النقاط: `{user.get('points', 0)}` نقطة\n\n"
-            f"📊 **المجاني المتبقي لليوم:**\n"
-            f"• تلخيص: `{DAILY_FREE_LIMITS['pdf_count'] - limits['pdf_count']}`\n"
-            f"• ترجمة: `{DAILY_FREE_LIMITS['translate_count'] - limits['translate_count']}`\n"
-            f"• صوتيات: `{DAILY_FREE_LIMITS['voice_count'] - limits['voice_count']}`\n\n"
-            f"💡 *لتحويل النقاط استخدم الأمر:*\n`/transfer {user_id} 10`"
+            f"👤 <b>معلومات حسابك</b>\n"
+            f"🆔 الآيدي: <code>{user_id}</code>\n"
+            f"🪙 رصيد النقاط: <code>{user.get('points', 0)}</code> نقطة\n\n"
+            f"📊 <b>المجاني المتبقي لليوم:</b>\n"
+            f"• تلخيص: <code>{DAILY_FREE_LIMITS['pdf_count'] - limits.get('pdf_count', 0)}</code>\n"
+            f"• ترجمة: <code>{DAILY_FREE_LIMITS['translate_count'] - limits.get('translate_count', 0)}</code>\n"
+            f"• صوتيات: <code>{DAILY_FREE_LIMITS['voice_count'] - limits.get('voice_count', 0)}</code>\n\n"
+            f"💡 <i>لتحويل النقاط استخدم الأمر:</i>\n<code>/transfer {user_id} 10</code>"
         )
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        await update.message.reply_text(msg, parse_mode="HTML")
         return
 
     if text == "🔗 دعوة الأصدقاء":
         ref_link = f"https://t.me/{bot_username}?start={user_id}"
         await update.message.reply_text(
-            f"🎁 **اربح نقاط مجانية!**\n"
-            f"شارك هذا الرابط مع أصدقائك، وستحصل على `2` نقطة لكل شخص يدخل البوت عن طريقك:\n\n{ref_link}",
-            parse_mode="Markdown"
+            f"🎁 <b>اربح نقاط مجانية!</b>\nشارك هذا الرابط وستحصل على <code>2</code> نقطة لكل شخص:\n\n{ref_link}",
+            parse_mode="HTML"
         )
         return
 
     if text == "🛒 شحن نقاط":
         keyboard = []
         for key, pkg in STAR_PACKAGES.items():
-            keyboard.append([InlineKeyboardButton(
-                f"⭐️ {pkg['stars']} نجمة = 🪙 {pkg['points']} نقطة", 
-                callback_data=f"buy_{key}"
-            )])
+            keyboard.append([InlineKeyboardButton(f"⭐️ {pkg['stars']} نجمة = 🪙 {pkg['points']} نقطة", callback_data=f"buy_{key}")])
         await update.message.reply_text("اختر الباقة المناسبة لك:", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
@@ -290,13 +313,12 @@ async def menu_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📄 تلخيص PDF": ("pdf", "📄 أرسل ملف PDF للتلخيص:"),
         "🎙️ تفريغ صوت": ("voice", "🎙️ أرسل التسجيل الصوتي:"),
         "🌐 ترجمة": ("translate", "🌐 أرسل النص للترجمة:"),
-        "🖼️ تصميم إنفوجرافيك": ("infographic", "🖼️ أرسل نصاً أو ملف PDF وسأقوم بتصميم إنفوجرافيك له (التكلفة: 5 نقاط):")
+        "🖼️ تصميم إنفوجرافيك": ("infographic", "🖼️ أرسل نصاً أو ملف PDF لتصميم إنفوجرافيك (التكلفة: 5 نقاط):")
     }
     
     if text in mapping:
-        state, msg = mapping[text]
-        context.user_data["state"] = state
-        await update.message.reply_text(msg)
+        context.user_data["state"] = mapping[text][0]
+        await update.message.reply_text(mapping[text][1])
 
 # =========================================================
 # SERVICE EXECUTOR
@@ -311,17 +333,15 @@ async def execute_service(update: Update, context: ContextTypes.DEFAULT_TYPE, se
     cost = POINTS_COSTS[service_type]
     
     if not is_free and user.get("points", 0) < cost:
-        await update.message.reply_text(f"❌ رصيدك غير كافٍ. (تحتاج {cost} نقاط)\nاضغط '🛒 شحن نقاط' أو '🔗 دعوة الأصدقاء'.")
+        await update.message.reply_text(f"❌ رصيدك غير كافٍ. (تحتاج {cost} نقاط)")
         return
 
-    status_msg = await update.message.reply_text("⏳ جاري المعالجة بواسطة الذكاء الاصطناعي... قد يستغرق دقيقة.")
+    status_msg = await update.message.reply_text("⏳ جاري المعالجة بواسطة الذكاء الاصطناعي...")
 
     try:
         result = await task_coro
-        
         if is_free:
-            await db_request("PATCH", "daily_limits", params={"user_id": f"eq.{user_id}"}, 
-                             json_data={service_type: limits[service_type] + 1})
+            await db_request("PATCH", "daily_limits", params={"user_id": f"eq.{user_id}"}, json_data={service_type: limits.get(service_type, 0) + 1})
         else:
             await update_points(user_id, -cost)
 
@@ -333,7 +353,10 @@ async def execute_service(update: Update, context: ContextTypes.DEFAULT_TYPE, se
             
     except Exception as e:
         logger.error(f"Service Error: {e}")
-        await status_msg.edit_text("❌ حدث خطأ، يرجى المحاولة لاحقاً.")
+        if "ALL_KEYS_EXHAUSTED" in str(e):
+            await status_msg.edit_text("❌ جميع سيرفرات الذكاء الاصطناعي مزدحمة حالياً. يرجى المحاولة بعد ساعة.")
+        else:
+            await status_msg.edit_text("❌ حدث خطأ غير متوقع، يرجى المحاولة لاحقاً.")
     finally:
         context.user_data["state"] = None
 
@@ -373,95 +396,56 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
     if state == "translate":
-        async def task():
-            return await process_text_with_gemini(text=text, prompt="ترجم النص إلى العربية باحترافية:")
+        async def task(): return await process_text_with_gemini(text=text, prompt="ترجم النص إلى العربية باحترافية:")
         await execute_service(update, context, "translate_count", task())
-        
     elif state == "infographic":
-        async def task():
-            return await generate_infographic(text_content=text)
+        async def task(): return await generate_infographic(text_content=text)
         await execute_service(update, context, "image_count", task(), is_image=True)
 
 # =========================================================
-# POINTS TRANSFER & PAYMENTS (TELEGRAM STARS)
+# PAYMENTS & TRANSFER & ADMIN
 # =========================================================
 
 async def cmd_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/transfer 123456789 10"""
     user_id = str(update.effective_user.id)
     try:
-        target_id = context.args[0]
-        amount = int(context.args[1])
+        target_id, amount = context.args[0], int(context.args[1])
         if amount <= 0: raise ValueError
     except:
-        await update.message.reply_text("❌ الصيغة الخاطئة. الاستخدام:\n`/transfer <ID> <الكمية>`", parse_mode="Markdown")
-        return
-
-    if user_id == target_id:
-        await update.message.reply_text("❌ لا يمكنك التحويل لنفسك.")
-        return
+        return await update.message.reply_text("❌ الصيغة الخاطئة:\n<code>/transfer ID Amount</code>", parse_mode="HTML")
 
     sender = await get_or_init_user(update.effective_user)
-    if sender.get("points", 0) < amount:
-        await update.message.reply_text("❌ رصيدك غير كافٍ لإتمام التحويل.")
-        return
-
+    if sender.get("points", 0) < amount: return await update.message.reply_text("❌ رصيدك غير كافٍ.")
     target_user = await db_request("GET", "users", params={"user_id": f"eq.{target_id}"})
-    if not target_user:
-        await update.message.reply_text("❌ المستخدم غير مسجل في البوت.")
-        return
+    if not target_user: return await update.message.reply_text("❌ المستخدم غير مسجل.")
 
     await update_points(user_id, -amount)
     await update_points(target_id, amount)
-    
-    await update.message.reply_text(f"✅ تم تحويل {amount} نقطة بنجاح إلى المستخدم {target_id}.")
-    try:
-        await context.bot.send_message(chat_id=int(target_id), text=f"🎉 لقد تلقيت تحويلاً بقيمة {amount} نقطة!")
+    await update.message.reply_text(f"✅ تم تحويل {amount} نقطة.")
+    try: await context.bot.send_message(chat_id=int(target_id), text=f"🎉 تلقيت تحويلاً بقيمة {amount} نقطة!")
     except: pass
 
 async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
     pkg_key = query.data.split("_", 1)[1]
     pkg = STAR_PACKAGES.get(pkg_key)
     if not pkg: return
-
-    title = pkg["title"]
-    description = f"شراء {pkg['points']} نقطة لاستخدام خدمات الذكاء الاصطناعي."
-    payload = f"buy_points_{update.effective_user.id}_{pkg['points']}"
-    
     await context.bot.send_invoice(
-        chat_id=update.effective_chat.id,
-        title=title,
-        description=description,
-        payload=payload,
-        provider_token="", # فارغ دائماً لنجوم تلغرام
-        currency="XTR",
+        chat_id=update.effective_chat.id, title=pkg["title"], description=f"شراء {pkg['points']} نقطة",
+        payload=f"buy_points_{update.effective_user.id}_{pkg['points']}", provider_token="", currency="XTR",
         prices=[LabeledPrice("نجوم", pkg["stars"])]
     )
 
 async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.pre_checkout_query
-    if query.invoice_payload.startswith("buy_points_"):
-        await query.answer(ok=True)
-    else:
-        await query.answer(ok=False, error_message="طلب غير صالح.")
+    await query.answer(ok=query.invoice_payload.startswith("buy_points_"), error_message="طلب غير صالح.")
 
 async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    payload = update.message.successful_payment.invoice_payload
-    parts = payload.split("_")
-    
+    parts = update.message.successful_payment.invoice_payload.split("_")
     if len(parts) == 4 and parts[1] == "points":
-        user_id = parts[2]
-        points_to_add = int(parts[3])
-        
-        await update_points(user_id, points_to_add)
-        await update.message.reply_text(f"✅ شكراً لك! تمت إضافة {points_to_add} نقطة إلى حسابك بنجاح.")
-
-# =========================================================
-# ADMIN PANEL
-# =========================================================
+        await update_points(parts[2], int(parts[3]))
+        await update.message.reply_text(f"✅ تمت إضافة {parts[3]} نقطة إلى حسابك بنجاح.")
 
 async def check_admin(update: Update):
     if update.effective_user.id not in ADMIN_IDS:
@@ -472,43 +456,28 @@ async def check_admin(update: Update):
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_admin(update): return
     users = await db_request("GET", "users")
-    count = len(users) if users else 0
-    await update.message.reply_text(
-        f"🛠 **لوحة التحكم**\n"
-        f"👥 إجمالي المستخدمين: {count}\n\n"
-        f"الأوامر المتاحة:\n"
-        f"`/addpoints <ID> <Amount>` - إضافة نقاط لمستخدم\n"
-        f"`/broadcast <Text>` - إرسال رسالة للجميع",
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text(f"🛠 <b>لوحة التحكم</b>\n👥 المستخدمين: <code>{len(users) if users else 0}</code>", parse_mode="HTML")
 
 async def cmd_addpoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_admin(update): return
     try:
-        uid = context.args[0]
-        amt = int(context.args[1])
-        await update_points(uid, amt)
-        await update.message.reply_text(f"✅ تمت إضافة {amt} نقطة للمستخدم {uid}.")
-    except:
-        await update.message.reply_text("❌ خطأ بالصيغة: `/addpoints id 50`")
+        await update_points(context.args[0], int(context.args[1]))
+        await update.message.reply_text(f"✅ تمت الإضافة.")
+    except: await update.message.reply_text("❌ خطأ بالصيغة.")
 
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_admin(update): return
     text = " ".join(context.args)
-    if not text:
-        await update.message.reply_text("❌ اكتب الرسالة بعد الأمر.")
-        return
+    if not text: return await update.message.reply_text("❌ اكتب الرسالة بعد الأمر.")
     
     users = await db_request("GET", "users")
-    sent = 0
     msg = await update.message.reply_text("⏳ جاري الإرسال...")
     for u in users:
         try:
-            await context.bot.send_message(chat_id=int(u["user_id"]), text=f"📢 **إعلان:**\n{text}", parse_mode="Markdown")
-            sent += 1
-            await asyncio.sleep(0.05) # تجنب الحظر
+            await context.bot.send_message(chat_id=int(u["user_id"]), text=f"📢 <b>إعلان:</b>\n\n{text}", parse_mode="HTML")
+            await asyncio.sleep(0.05)
         except: pass
-    await msg.edit_text(f"✅ تم الإرسال إلى {sent} مستخدم.")
+    await msg.edit_text("✅ تم الإرسال.")
 
 # =========================================================
 # FASTAPI & WEBHOOK
@@ -521,9 +490,7 @@ async def lifespan(app: FastAPI):
     global http_client
     http_client = httpx.AsyncClient()
     await ptb_app.initialize()
-    
-    webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/webhook"
-    await ptb_app.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
+    await ptb_app.bot.set_webhook(url=f"{RENDER_EXTERNAL_URL.rstrip('/')}/webhook", allowed_updates=Update.ALL_TYPES)
     yield
     await ptb_app.shutdown()
     await http_client.aclose()
@@ -532,31 +499,21 @@ fast_app = FastAPI(lifespan=lifespan)
 
 @fast_app.post("/webhook")
 async def webhook(request: Request):
-    data = await request.json()
-    update = Update.de_json(data, ptb_app.bot)
-    await ptb_app.process_update(update)
+    await ptb_app.process_update(Update.de_json(await request.json(), ptb_app.bot))
     return Response(status_code=status.HTTP_200_OK)
 
-# Register Handlers
 ptb_app.add_handler(CommandHandler("start", cmd_start))
 ptb_app.add_handler(CommandHandler("transfer", cmd_transfer))
-
-# Admin
 ptb_app.add_handler(CommandHandler("admin", cmd_admin))
 ptb_app.add_handler(CommandHandler("addpoints", cmd_addpoints))
 ptb_app.add_handler(CommandHandler("broadcast", cmd_broadcast))
-
-# Menus & Media
 ptb_app.add_handler(MessageHandler(filters.Regex("^(📄 تلخيص PDF|🖼️ تصميم إنفوجرافيك|🎙️ تفريغ صوت|🌐 ترجمة|🛒 شحن نقاط|🔗 دعوة الأصدقاء|👤 حسابي)$"), menu_logic))
 ptb_app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
 ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
-
-# Payments
 ptb_app.add_handler(CallbackQueryHandler(buy_callback, pattern="^buy_"))
 ptb_app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
 ptb_app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(fast_app, host="0.0.0.0", port=port)
+    uvicorn.run(fast_app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
