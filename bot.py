@@ -77,7 +77,7 @@ def get_env(key, default=None, required=True):
 
 TOKEN = get_env("TELEGRAM_BOT_TOKEN")
 SUPABASE_URL = get_env("SUPABASE_URL")
-SUPABASE_KEY = get_env("SUPABASE_SERVICE_KEY") or get_env("SUPABASE_KEY")
+SUPABASE_KEY = get_env("SUPABASE_KEY")
 GOOGLE_API_KEY = get_env("GEMINI_API_KEY")
 RENDER_EXTERNAL_URL = get_env("RENDER_EXTERNAL_URL")
 
