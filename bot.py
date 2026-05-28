@@ -468,4 +468,4 @@ if __name__ == "__main__":
     import uvicorn
     # تأكد من أن المنفذ يتوافق مع ما تطلبه استضافة Render (غالباً المنفذ 10000 أو يتم سحبه من البيئة)
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
+    uvicorn.run("bot:app", host="0.0.0.0", port=port)
