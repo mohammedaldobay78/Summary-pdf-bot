@@ -78,8 +78,7 @@ SUPABASE_URL = get_env("SUPABASE_URL")
 SUPABASE_KEY = get_env("SUPABASE_KEY")
 RENDER_EXTERNAL_URL = get_env("RENDER_EXTERNAL_URL")
 
-# جلب المفاتيح المتعددة مفصولة بفاصلة
-RAW_KEYS = get_env("GEMINI_API_KEYS") # غيرنا اسم المتغير ليصبح جمعاً
+RAW_KEYS = get_env("GEMINI_API_KEYS")
 API_KEYS = [k.strip() for k in RAW_KEYS.split(",") if k.strip()]
 CURRENT_KEY_INDEX = 0
 
@@ -87,14 +86,9 @@ if not API_KEYS:
     raise ValueError("No Gemini API keys provided in GEMINI_API_KEYS")
 
 def get_current_ai_client():
-    """توليد عميل (Client) باستخدام المفتاح النشط حالياً"""
     return genai.Client(api_key=API_KEYS[CURRENT_KEY_INDEX])
 
 async def execute_with_key_rotation(task_func, *args, **kwargs):
-    """
-    نظام ذكي لتجربة المفاتيح.
-    إذا انتهى رصيد المفتاح الحالي، ينتقل للمفتاح الذي يليه تلقائياً.
-    """
     global CURRENT_KEY_INDEX
     attempts = 0
     max_attempts = len(API_KEYS)
@@ -102,22 +96,20 @@ async def execute_with_key_rotation(task_func, *args, **kwargs):
     while attempts < max_attempts:
         client = get_current_ai_client()
         try:
-            # تمرير العميل (Client) كأول متغير للدالة
             return await task_func(client, *args, **kwargs)
         except Exception as e:
             error_msg = str(e).lower()
-            # التحقق إذا كان الخطأ بسبب انتهاء الحصة 429
-            if "429" in error_msg or "quota" in error_msg or "exhausted" in error_msg:
-                logger.warning(f"⚠️ API Key {CURRENT_KEY_INDEX + 1}/{len(API_KEYS)} Exhausted. Switching...")
+            
+            # إذا كان الخطأ بسبب الرصيد (429) أو أن المفتاح غير صالح/مكتوب خطأ (400 Invalid/API_KEY_INVALID)
+            if any(err in error_msg for err in ["429", "quota", "exhausted", "invalid_argument", "api_key_invalid"]):
+                logger.warning(f"⚠️ API Key {CURRENT_KEY_INDEX + 1}/{len(API_KEYS)} Failed ({error_msg[:40]}). Switching...")
                 CURRENT_KEY_INDEX = (CURRENT_KEY_INDEX + 1) % len(API_KEYS)
                 attempts += 1
             else:
-                # إذا كان خطأ آخر (مثل ملف غير صالح) يتم إرجاعه فوراً
+                # إذا كان خطأ مختلفاً تماماً نعيد الخطأ للمستخدم
                 raise e
     
-    # إذا لفت الدورة على كل المفاتيح وكلها منتهية
     raise Exception("ALL_KEYS_EXHAUSTED")
-
 
 http_client: httpx.AsyncClient = None
 
@@ -153,7 +145,6 @@ async def update_points(user_id: str, amount: int):
 async def get_or_init_user(tg_user: User, context: ContextTypes.DEFAULT_TYPE = None, referrer_id=None):
     user_id = str(tg_user.id)
     data = await db_request("GET", "users", params={"user_id": f"eq.{user_id}"})
-    
     if data: return data[0]
 
     new_user = {
@@ -208,7 +199,7 @@ def get_main_keyboard():
     ], resize_keyboard=True)
 
 # =========================================================
-# AI CORE WORKERS (Modified for Key Rotation)
+# AI CORE WORKERS
 # =========================================================
 
 async def _task_process_text(client: genai.Client, file_path=None, text=None, prompt=""):
@@ -221,8 +212,9 @@ async def _task_process_text(client: genai.Client, file_path=None, text=None, pr
     else:
         contents = f"{prompt}\n\n{text}"
 
+    # عدنا للنموذج الأحدث gemini-2.0-flash
     response = client.models.generate_content(
-        model="gemini-1.5-flash",
+        model="gemini-2.0-flash",
         contents=contents
     )
     return response.text
@@ -230,7 +222,6 @@ async def _task_process_text(client: genai.Client, file_path=None, text=None, pr
 async def _task_generate_info(client: genai.Client, file_path=None, text_content=None):
     extract_prompt = "اكتب وصفاً مفصلاً باللغة الإنجليزية (Prompt) لتصميم إنفوجرافيك احترافي. ركز على الألوان والأيقونات بدون نصوص معقدة:"
     
-    # استخراج الوصف باستخدام الموديل العادي عبر نفس العميل
     image_prompt = await _task_process_text(client, file_path, text_content, extract_prompt)
     
     result = client.models.generate_images(
@@ -244,7 +235,6 @@ async def _task_generate_info(client: genai.Client, file_path=None, text_content
     )
     return result.generated_images[0].image.image_bytes
 
-# دوال التغليف (Wrappers) التي تنادي نظام تبديل المفاتيح
 async def process_text_with_gemini(file_path=None, text=None, prompt=""):
     return await execute_with_key_rotation(_task_process_text, file_path=file_path, text=text, prompt=prompt)
 
@@ -354,9 +344,9 @@ async def execute_service(update: Update, context: ContextTypes.DEFAULT_TYPE, se
     except Exception as e:
         logger.error(f"Service Error: {e}")
         if "ALL_KEYS_EXHAUSTED" in str(e):
-            await status_msg.edit_text("❌ جميع سيرفرات الذكاء الاصطناعي مزدحمة حالياً. يرجى المحاولة بعد ساعة.")
+            await status_msg.edit_text("❌ جميع سيرفرات الذكاء الاصطناعي مزدحمة حالياً. يرجى المحاولة بعد قليل.")
         else:
-            await status_msg.edit_text("❌ حدث خطأ غير متوقع، يرجى المحاولة لاحقاً.")
+            await status_msg.edit_text("❌ حدث خطأ غير متوقع في معالجة الملف، يرجى المحاولة لاحقاً.")
     finally:
         context.user_data["state"] = None
 
@@ -380,7 +370,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tg_file = await context.bot.get_file(doc.file_id)
             await tg_file.download_to_drive(file_path)
             if state == "pdf":
-                return await process_text_with_gemini(file_path, prompt="حلل الملف وقدم ملخصاً تنفيذياً باللغة العربية.")
+                return await process_text_with_gemini(file_path, prompt="حلل الملف المرفق وقدم ملخصاً تنفيذياً باللغة العربية مع إبراز النقاط الرئيسية بشكل منسق.")
             elif state == "infographic":
                 return await generate_infographic(file_path=file_path)
         finally:
@@ -396,7 +386,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
     if state == "translate":
-        async def task(): return await process_text_with_gemini(text=text, prompt="ترجم النص إلى العربية باحترافية:")
+        async def task(): return await process_text_with_gemini(text=text, prompt="ترجم النص التالي إلى اللغة العربية (أو الإنجليزية إذا كان النص عربياً) بشكل احترافي:")
         await execute_service(update, context, "translate_count", task())
     elif state == "infographic":
         async def task(): return await generate_infographic(text_content=text)
