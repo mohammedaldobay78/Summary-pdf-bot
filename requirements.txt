@@ -1,4 +1,5 @@
-Flask==3.0.3
-python-telegram-bot==21.0
-google-genai>=1.15.0
-requests==2.32.3
+fastapi
+uvicorn
+python-telegram-bot>=20.0
+google-genai
+httpx
