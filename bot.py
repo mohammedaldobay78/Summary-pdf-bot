@@ -4,12 +4,14 @@ import datetime
 import logging
 from io import BytesIO
 from contextlib import asynccontextmanager
+from typing import List, Optional
 
 import httpx
 from fastapi import FastAPI, Request, Response, status
 
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError  # لالتقاط أخطاء API
 
 from telegram import (
     Update,
@@ -19,7 +21,6 @@ from telegram import (
     LabeledPrice,
     User,
 )
-
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -40,7 +41,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ضع معرفات حسابات الأدمن هنا (ID)
 ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "123456789").split(",")]
 
 PRIMARY_CHANNEL = "@Axia_Tech"
@@ -48,7 +48,7 @@ DAILY_FREE_LIMITS = {
     "pdf_count": 3,
     "translate_count": 3,
     "voice_count": 1,
-    "image_count": 0 # لا يوجد مجاني للصور لتكلفتها
+    "image_count": 0
 }
 POINTS_COSTS = {
     "pdf_count": 3,
@@ -57,7 +57,6 @@ POINTS_COSTS = {
     "image_count": 5
 }
 
-# باقات نجوم تلغرام (Stars: Points)
 STAR_PACKAGES = {
     "pkg_1": {"stars": 1, "points": 3, "title": "باقة البداية"},
     "pkg_2": {"stars": 10, "points": 30, "title": "الباقة الأساسية"},
@@ -78,15 +77,44 @@ def get_env(key, default=None, required=True):
 TOKEN = get_env("TELEGRAM_BOT_TOKEN")
 SUPABASE_URL = get_env("SUPABASE_URL")
 SUPABASE_KEY = get_env("SUPABASE_KEY")
-GOOGLE_API_KEY = get_env("GEMINI_API_KEY")
+# هنا التعديل: مفتاح واحد أو عدة مفاتيح مفصولة بفواصل
+GEMINI_API_KEYS_RAW = get_env("GEMINI_API_KEYS")
+GEMINI_API_KEYS = [key.strip() for key in GEMINI_API_KEYS_RAW.split(",") if key.strip()]
+if not GEMINI_API_KEYS:
+    raise ValueError("GEMINI_API_KEYS must contain at least one key")
 RENDER_EXTERNAL_URL = get_env("RENDER_EXTERNAL_URL")
 
 # =========================================================
 # CLIENTS
 # =========================================================
 
-ai_client = genai.Client(api_key=GOOGLE_API_KEY)
+# سيتم إدارتها بواسطة KeyManager
 http_client: httpx.AsyncClient = None
+
+# =========================================================
+# GEMINI KEY MANAGER
+# =========================================================
+
+class GeminiKeyManager:
+    def __init__(self, keys: List[str]):
+        self.keys = keys
+        self.index = 0
+        self.lock = asyncio.Lock()
+        self.clients = [genai.Client(api_key=k) for k in keys]
+
+    async def get_current_client(self) -> genai.Client:
+        async with self.lock:
+            return self.clients[self.index]
+
+    async def handle_error_and_rotate(self):
+        """ينتظر 30 ثانية ثم ينتقل للمفتاح التالي بعد خطأ 429 أو 404."""
+        logger.warning(f"Key {self.index} hit rate limit/not found. Waiting 30s before switching.")
+        await asyncio.sleep(30)
+        async with self.lock:
+            self.index = (self.index + 1) % len(self.keys)
+            logger.info(f"Switched to key index {self.index}")
+
+key_manager = GeminiKeyManager(GEMINI_API_KEYS)
 
 # =========================================================
 # DATABASE LAYER
@@ -113,9 +141,9 @@ async def db_request(method, table, params=None, json_data=None):
         return []
 
 async def update_points(user_id: str, amount: int):
-    """إضافة أو خصم نقاط بشكل مباشر"""
     user_data = await db_request("GET", "users", params={"user_id": f"eq.{user_id}"})
-    if not user_data: return False
+    if not user_data:
+        return False
     new_points = max(0, user_data[0].get("points", 0) + amount)
     await db_request("PATCH", "users", params={"user_id": f"eq.{user_id}"}, json_data={"points": new_points})
     return True
@@ -123,24 +151,21 @@ async def update_points(user_id: str, amount: int):
 async def get_or_init_user(tg_user: User, context: ContextTypes.DEFAULT_TYPE = None, referrer_id=None):
     user_id = str(tg_user.id)
     data = await db_request("GET", "users", params={"user_id": f"eq.{user_id}"})
-    
+
     if data:
         return data[0]
 
-    # مستخدم جديد
     new_user = {
         "user_id": user_id,
         "username": tg_user.username or "Unknown",
-        "points": 5, 
+        "points": 5,
         "referred_by": str(referrer_id) if referrer_id else None
     }
     created = await db_request("POST", "users", json_data=new_user)
-    
-    # تهيئة حدود الاستخدام اليومي
+
     limits = {"user_id": user_id, "last_reset": str(datetime.date.today()), **{k: 0 for k in DAILY_FREE_LIMITS.keys()}}
     await db_request("POST", "daily_limits", json_data=limits)
-    
-    # مكافأة الإحالة (نقطتين للمُحيل)
+
     if referrer_id and str(referrer_id) != user_id:
         await update_points(str(referrer_id), 2)
         if context:
@@ -150,7 +175,8 @@ async def get_or_init_user(tg_user: User, context: ContextTypes.DEFAULT_TYPE = N
                     text="🎉 قام صديقك بالتسجيل عبر رابطك! تمت إضافة `2` نقطة لحسابك.",
                     parse_mode="Markdown"
                 )
-            except: pass
+            except:
+                pass
 
     return created[0] if created else new_user
 
@@ -182,46 +208,167 @@ def get_main_keyboard():
     ], resize_keyboard=True)
 
 # =========================================================
-# AI CORE WORKERS
+# AI CORE WORKERS (معدلة لتستخدم KeyManager مع إعادة المحاولة)
 # =========================================================
 
-async def process_text_with_gemini(file_path=None, text=None, prompt=""):
-    if file_path:
-        uploaded_file = ai_client.files.upload(file=file_path)
-        while uploaded_file.state.name == "PROCESSING":
-            await asyncio.sleep(2)
-            uploaded_file = ai_client.files.get(name=uploaded_file.name)
-        contents = [uploaded_file, prompt]
-    else:
-        contents = f"{prompt}\n\n{text}"
+async def call_gemini_with_retry(api_call):
+    """
+    دالة مساعدة لتنفيذ استدعاء Gemini مع إعادة المحاولة وتدوير المفاتيح عند 429/404.
+    """
+    max_attempts = len(GEMINI_API_KEYS) * 3
+    for attempt in range(1, max_attempts + 1):
+        client = await key_manager.get_current_client()
+        try:
+            return await api_call(client)
+        except APIError as e:
+            if e.code in [429, 404]:
+                logger.warning(f"Attempt {attempt}: Gemini API error {e.code}, rotating key.")
+                await key_manager.handle_error_and_rotate()
+                continue
+            else:
+                raise
+        except Exception:
+            raise
+    raise Exception("All Gemini API keys exhausted or failed after retries.")
 
-    response = ai_client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=contents
-    )
-    return response.text
+async def process_text_with_gemini(file_path=None, text=None, prompt=""):
+    async def api_call(client):
+        if file_path:
+            uploaded_file = client.files.upload(file=file_path)
+            while uploaded_file.state.name == "PROCESSING":
+                await asyncio.sleep(2)
+                uploaded_file = client.files.get(name=uploaded_file.name)
+            contents = [uploaded_file, prompt]
+        else:
+            contents = f"{prompt}\n\n{text}"
+
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=contents
+        )
+        return response.text
+
+    return await call_gemini_with_retry(api_call)
 
 async def generate_infographic(file_path=None, text_content=None):
-    """
-    1. يقرأ النص/الملف ويستخرج النقاط الرئيسية كـ 'وصف للصورة'
-    2. يرسل الوصف إلى نموذج Imagen 3 لتوليد الإنفوجرافيك
-    """
-    extract_prompt = "اكتب وصفاً مفصلاً باللغة الإنجليزية (Prompt) لتصميم إنفوجرافيك احترافي يلخص المعلومات التالية. الوصف يجب أن يركز على الألوان، الأيقونات، التوزيع البصري ولا يحتوي على نصوص معقدة، فقط عناوين رئيسية: "
-    
-    # 1. استخراج فكرة التصميم (Prompt)
-    image_prompt = await process_text_with_gemini(file_path, text_content, extract_prompt)
-    
-    # 2. توليد الصورة
-    result = ai_client.models.generate_images(
-        model='imagen-3.0-generate-001',
-        prompt=f"Professional infographic vector art, clean design, highly detailed, modern flat style, 8k resolution. {image_prompt}",
-        config=types.GenerateImagesConfig(
-            number_of_images=1,
-            output_mime_type="image/jpeg",
-            aspect_ratio="3:4"
+    async def api_call(client):
+        # استخراج وصف الصورة
+        extract_prompt = (
+            "اكتب وصفاً مفصلاً باللغة الإنجليزية (Prompt) لتصميم إنفوجرافيك احترافي يلخص المعلومات التالية. "
+            "الوصف يجب أن يركز على الألوان، الأيقونات، التوزيع البصري ولا يحتوي على نصوص معقدة، فقط عناوين رئيسية: "
         )
-    )
-    return result.generated_images[0].image.image_bytes
+        if file_path:
+            uploaded_file = client.files.upload(file=file_path)
+            while uploaded_file.state.name == "PROCESSING":
+                await asyncio.sleep(2)
+                uploaded_file = client.files.get(name=uploaded_file.name)
+            response_text = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=[uploaded_file, extract_prompt]
+            ).text
+        else:
+            response_text = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=f"{extract_prompt}\n\n{text_content}"
+            ).text
+
+        image_prompt = response_text.strip()
+        # توليد الصورة
+        result = client.models.generate_images(
+            model='imagen-3.0-generate-001',
+            prompt=f"Professional infographic vector art, clean design, highly detailed, modern flat style, 8k resolution. {image_prompt}",
+            config=types.GenerateImagesConfig(
+                number_of_images=1,
+                output_mime_type="image/jpeg",
+                aspect_ratio="3:4"
+            )
+        )
+        return result.generated_images[0].image.image_bytes
+
+    return await call_gemini_with_retry(api_call)
+
+# =========================================================
+# QUEUE SYSTEM (نظام الطابور)
+# =========================================================
+
+job_queue = asyncio.Queue()
+
+async def ai_worker():
+    """خلفية تعالج الطلبات من الطابور بالتسلسل."""
+    logger.info("AI worker started")
+    while True:
+        job = await job_queue.get()
+        try:
+            chat_id = job["chat_id"]
+            user_id = job["user_id"]
+            service_type = job["service_type"]
+            is_image = job["is_image"]
+            file_id = job.get("file_id")
+            text = job.get("text")
+            bot = job["bot"]
+
+            # تحميل الملف إذا لزم
+            file_path = None
+            if file_id:
+                file_path = f"tmp_{user_id}_{file_id}"
+                try:
+                    tg_file = await bot.get_file(file_id)
+                    await tg_file.download_to_drive(file_path)
+                except Exception as e:
+                    logger.error(f"Failed to download file: {e}")
+                    await bot.send_message(chat_id=chat_id, text="❌ فشل تحميل الملف، أعد المحاولة.")
+                    continue
+
+            # تنفيذ المهمة حسب نوع الخدمة
+            try:
+                if service_type == "pdf":
+                    result = await process_text_with_gemini(
+                        file_path=file_path,
+                        prompt="حلل الملف وقدم ملخصاً تنفيذياً باللغة العربية."
+                    )
+                elif service_type == "translate":
+                    result = await process_text_with_gemini(
+                        text=text,
+                        prompt="ترجم النص إلى العربية باحترافية:"
+                    )
+                elif service_type == "infographic":
+                    result = await generate_infographic(file_path=file_path, text_content=text)
+                else:
+                    continue
+
+                # تحديث الحدود أو خصم النقاط بعد النجاح
+                limits = await check_and_reset_limits(user_id)
+                is_free = limits.get(service_type, 0) < DAILY_FREE_LIMITS.get(service_type, 0)
+
+                if is_free:
+                    await db_request("PATCH", "daily_limits",
+                                     params={"user_id": f"eq.{user_id}"},
+                                     json_data={service_type: limits[service_type] + 1})
+                else:
+                    await update_points(user_id, -POINTS_COSTS[service_type])
+
+                # إرسال النتيجة للمستخدم
+                if is_image:
+                    await bot.send_photo(chat_id=chat_id, photo=result, caption="✨ تم تصميم الإنفوجرافيك!")
+                else:
+                    # النص قد يكون طويلاً، نقتطعه
+                    text_result = result[:4096]
+                    await bot.send_message(chat_id=chat_id, text=text_result)
+
+                logger.info(f"Job completed for user {user_id}, type {service_type}")
+
+            except Exception as e:
+                logger.error(f"AI processing error: {e}")
+                await bot.send_message(chat_id=chat_id, text="❌ حدث خطأ أثناء المعالجة، حاول مرة أخرى لاحقاً.")
+            finally:
+                # تنظيف الملف المؤقت
+                if file_path and os.path.exists(file_path):
+                    os.remove(file_path)
+
+        except Exception as e:
+            logger.error(f"Worker exception: {e}")
+        finally:
+            job_queue.task_done()
 
 # =========================================================
 # TELEGRAM HANDLERS: START & MENU
@@ -232,14 +379,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     referrer = context.args[0] if context.args else None
     await get_or_init_user(user, context, referrer)
 
-    # التحقق من الاشتراك
     try:
         member = await context.bot.get_chat_member(PRIMARY_CHANNEL, user.id)
         if member.status in ["left", "kicked"]:
             keyboard = [[InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{PRIMARY_CHANNEL[1:]}")]]
             await update.message.reply_text("⚠️ يجب الاشتراك بالقناة أولاً.", reply_markup=InlineKeyboardMarkup(keyboard))
             return
-    except Exception: pass
+    except Exception:
+        pass
 
     await update.message.reply_text(
         f"مرحباً بك {user.first_name}! 👋\nاختر الخدمة المطلوبة:",
@@ -280,7 +427,7 @@ async def menu_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = []
         for key, pkg in STAR_PACKAGES.items():
             keyboard.append([InlineKeyboardButton(
-                f"⭐️ {pkg['stars']} نجمة = 🪙 {pkg['points']} نقطة", 
+                f"⭐️ {pkg['stars']} نجمة = 🪙 {pkg['points']} نقطة",
                 callback_data=f"buy_{key}"
             )])
         await update.message.reply_text("اختر الباقة المناسبة لك:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -292,107 +439,84 @@ async def menu_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🌐 ترجمة": ("translate", "🌐 أرسل النص للترجمة:"),
         "🖼️ تصميم إنفوجرافيك": ("infographic", "🖼️ أرسل نصاً أو ملف PDF وسأقوم بتصميم إنفوجرافيك له (التكلفة: 5 نقاط):")
     }
-    
+
     if text in mapping:
         state, msg = mapping[text]
         context.user_data["state"] = state
         await update.message.reply_text(msg)
 
 # =========================================================
-# SERVICE EXECUTOR
+# SERVICE ENQUEUEING (إضافة للطابور بدلاً من التنفيذ الفوري)
 # =========================================================
 
-async def execute_service(update: Update, context: ContextTypes.DEFAULT_TYPE, service_type, task_coro, is_image=False):
+async def enqueue_service(update: Update, context: ContextTypes.DEFAULT_TYPE, service_type,
+                          file_id=None, text=None, is_image=False):
     user_id = str(update.effective_user.id)
     limits = await check_and_reset_limits(user_id)
     user = await get_or_init_user(update.effective_user)
-    
+
     is_free = limits.get(service_type, 0) < DAILY_FREE_LIMITS.get(service_type, 0)
     cost = POINTS_COSTS[service_type]
-    
+
     if not is_free and user.get("points", 0) < cost:
-        await update.message.reply_text(f"❌ رصيدك غير كافٍ. (تحتاج {cost} نقاط)\nاضغط '🛒 شحن نقاط' أو '🔗 دعوة الأصدقاء'.")
+        await update.message.reply_text(
+            f"❌ رصيدك غير كافٍ. (تحتاج {cost} نقاط)\nاضغط '🛒 شحن نقاط' أو '🔗 دعوة الأصدقاء'."
+        )
         return
 
-    status_msg = await update.message.reply_text("⏳ جاري المعالجة بواسطة الذكاء الاصطناعي... قد يستغرق دقيقة.")
+    # إضافة للطابور
+    job = {
+        "chat_id": update.effective_chat.id,
+        "user_id": user_id,
+        "service_type": service_type,
+        "is_image": is_image,
+        "file_id": file_id,
+        "text": text,
+        "bot": context.bot
+    }
+    await job_queue.put(job)
+    await update.message.reply_text("⏳ تمت إضافة طلبك إلى قائمة الانتظار. سيتم إشعارك عند الانتهاء.")
 
-    try:
-        result = await task_coro
-        
-        if is_free:
-            await db_request("PATCH", "daily_limits", params={"user_id": f"eq.{user_id}"}, 
-                             json_data={service_type: limits[service_type] + 1})
-        else:
-            await update_points(user_id, -cost)
-
-        await status_msg.delete()
-        if is_image:
-            await update.message.reply_photo(photo=result, caption="✨ تم تصميم الإنفوجرافيك!")
-        else:
-            await update.message.reply_text(result[:4096])
-            
-    except Exception as e:
-        logger.error(f"Service Error: {e}")
-        await status_msg.edit_text("❌ حدث خطأ، يرجى المحاولة لاحقاً.")
-    finally:
-        context.user_data["state"] = None
+    # لا نحتاج للحالة بعد الآن
+    context.user_data["state"] = None
 
 # =========================================================
-# MEDIA & TEXT HANDLERS
+# MEDIA & TEXT HANDLERS (معدلة لتستخدم enqueue_service)
 # =========================================================
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get("state")
-    if state not in ["pdf", "infographic"] or not update.message.document: return
-    
+    if state not in ["pdf", "infographic"] or not update.message.document:
+        return
+
     doc = update.message.document
     if not doc.file_name.lower().endswith(".pdf"):
         await update.message.reply_text("❌ أرسل ملف PDF فقط.")
         return
 
-    file_path = f"tmp_{update.effective_user.id}_{doc.file_id}.pdf"
-    
-    async def task_pdf():
-        try:
-            tg_file = await context.bot.get_file(doc.file_id)
-            await tg_file.download_to_drive(file_path)
-            if state == "pdf":
-                return await process_text_with_gemini(file_path, prompt="حلل الملف وقدم ملخصاً تنفيذياً باللغة العربية.")
-            elif state == "infographic":
-                return await generate_infographic(file_path=file_path)
-        finally:
-            if os.path.exists(file_path): os.remove(file_path)
-
-    if state == "infographic":
-        await execute_service(update, context, "image_count", task_pdf(), is_image=True)
-    else:
-        await execute_service(update, context, "pdf_count", task_pdf())
+    # نمرر file_id بدلاً من تحميل الملف هنا
+    await enqueue_service(update, context, state, file_id=doc.file_id, is_image=(state == "infographic"))
 
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get("state")
     text = update.message.text
 
     if state == "translate":
-        async def task():
-            return await process_text_with_gemini(text=text, prompt="ترجم النص إلى العربية باحترافية:")
-        await execute_service(update, context, "translate_count", task())
-        
+        await enqueue_service(update, context, "translate_count", text=text)
     elif state == "infographic":
-        async def task():
-            return await generate_infographic(text_content=text)
-        await execute_service(update, context, "image_count", task(), is_image=True)
+        await enqueue_service(update, context, "image_count", text=text, is_image=True)
 
 # =========================================================
 # POINTS TRANSFER & PAYMENTS (TELEGRAM STARS)
 # =========================================================
 
 async def cmd_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/transfer 123456789 10"""
     user_id = str(update.effective_user.id)
     try:
         target_id = context.args[0]
         amount = int(context.args[1])
-        if amount <= 0: raise ValueError
+        if amount <= 0:
+            raise ValueError
     except:
         await update.message.reply_text("❌ الصيغة الخاطئة. الاستخدام:\n`/transfer <ID> <الكمية>`", parse_mode="Markdown")
         return
@@ -413,30 +537,32 @@ async def cmd_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update_points(user_id, -amount)
     await update_points(target_id, amount)
-    
+
     await update.message.reply_text(f"✅ تم تحويل {amount} نقطة بنجاح إلى المستخدم {target_id}.")
     try:
         await context.bot.send_message(chat_id=int(target_id), text=f"🎉 لقد تلقيت تحويلاً بقيمة {amount} نقطة!")
-    except: pass
+    except:
+        pass
 
 async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
+
     pkg_key = query.data.split("_", 1)[1]
     pkg = STAR_PACKAGES.get(pkg_key)
-    if not pkg: return
+    if not pkg:
+        return
 
     title = pkg["title"]
     description = f"شراء {pkg['points']} نقطة لاستخدام خدمات الذكاء الاصطناعي."
     payload = f"buy_points_{update.effective_user.id}_{pkg['points']}"
-    
+
     await context.bot.send_invoice(
         chat_id=update.effective_chat.id,
         title=title,
         description=description,
         payload=payload,
-        provider_token="", # فارغ دائماً لنجوم تلغرام
+        provider_token="",
         currency="XTR",
         prices=[LabeledPrice("نجوم", pkg["stars"])]
     )
@@ -451,11 +577,11 @@ async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     payload = update.message.successful_payment.invoice_payload
     parts = payload.split("_")
-    
+
     if len(parts) == 4 and parts[1] == "points":
         user_id = parts[2]
         points_to_add = int(parts[3])
-        
+
         await update_points(user_id, points_to_add)
         await update.message.reply_text(f"✅ شكراً لك! تمت إضافة {points_to_add} نقطة إلى حسابك بنجاح.")
 
@@ -470,7 +596,8 @@ async def check_admin(update: Update):
     return True
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin(update): return
+    if not await check_admin(update):
+        return
     users = await db_request("GET", "users")
     count = len(users) if users else 0
     await update.message.reply_text(
@@ -483,7 +610,8 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_addpoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin(update): return
+    if not await check_admin(update):
+        return
     try:
         uid = context.args[0]
         amt = int(context.args[1])
@@ -493,12 +621,13 @@ async def cmd_addpoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ خطأ بالصيغة: `/addpoints id 50`")
 
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin(update): return
+    if not await check_admin(update):
+        return
     text = " ".join(context.args)
     if not text:
         await update.message.reply_text("❌ اكتب الرسالة بعد الأمر.")
         return
-    
+
     users = await db_request("GET", "users")
     sent = 0
     msg = await update.message.reply_text("⏳ جاري الإرسال...")
@@ -506,34 +635,38 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(chat_id=int(u["user_id"]), text=f"📢 **إعلان:**\n{text}", parse_mode="Markdown")
             sent += 1
-            await asyncio.sleep(0.05) # تجنب الحظر
-        except: pass
+            await asyncio.sleep(0.05)
+        except:
+            pass
     await msg.edit_text(f"✅ تم الإرسال إلى {sent} مستخدم.")
 
 # =========================================================
-# FASTAPI & WEBHOOK & CRON JOBS
+# FASTAPI & WEBHOOK
 # =========================================================
 
 ptb_app = Application.builder().token(TOKEN).build()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global http_client
+    global http_client, worker_task
     http_client = httpx.AsyncClient()
     await ptb_app.initialize()
-    
-    # إعداد Webhook
+
+    # بدء معالج الطابور
+    worker_task = asyncio.create_task(ai_worker())
+
     webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/webhook"
     await ptb_app.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
-    
+
     yield
-    
+
+    # إيقاف المعالج عند الخروج
+    worker_task.cancel()
     await ptb_app.shutdown()
     await http_client.aclose()
 
 fast_app = FastAPI(lifespan=lifespan)
 
-# 1. مسار الـ Webhook الخاص بتلغرام
 @fast_app.post("/webhook")
 async def webhook(request: Request):
     data = await request.json()
@@ -541,42 +674,9 @@ async def webhook(request: Request):
     await ptb_app.process_update(update)
     return Response(status_code=status.HTTP_200_OK)
 
-# 2. مسار الإيقاظ (Keep-Alive) لـ Cron-Job
-@fast_app.get("/")
-async def ping():
-    """هذا المسار يزوره cron-job.org كل 5-10 دقائق لمنع السيرفر من النوم"""
-    return {"status": "alive", "message": "Bot is running perfectly!"}
-
-# 3. مسار للمهام المجدولة (يُطلب يومياً مثلاً عبر Cron Job)
-@fast_app.get("/cron/daily-tasks")
-async def daily_cron_tasks(secret: str):
-    """
-    مسار مخصص لتنفيذ مهام يومية (مثل إرسال إحصائيات للأدمن).
-    يجب توفير secret مطابق للحماية.
-    """
-    # ضع هنا كلمة سر خاصة بك في متغيرات البيئة لمنع أي شخص من تشغيل المسار
-    CRON_SECRET = os.getenv("CRON_SECRET", "my_super_secret_cron_key_123")
-    
-    if secret != CRON_SECRET:
-        return Response(status_code=status.HTTP_403_FORBIDDEN, content="Unauthorized")
-    
-    try:
-        # مثال لمهمة مجدولة: إرسال عدد المستخدمين للأدمن الأساسي كل يوم
-        users = await db_request("GET", "users")
-        count = len(users) if users else 0
-        
-        if ADMIN_IDS:
-            admin_id = ADMIN_IDS[0] # نرسل لأول أدمن
-            await ptb_app.bot.send_message(
-                chat_id=admin_id,
-                text=f"📊 **تقرير Cron Job اليومي**\n👥 إجمالي المستخدمين في قاعدة البيانات: {count}",
-                parse_mode="Markdown"
-            )
-        
-        return {"status": "success", "message": "Daily tasks executed"}
-    except Exception as e:
-        logger.error(f"Cron error: {e}")
-        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+@fast_app.get("/health")
+async def health():
+    return {"status": "running"}
 
 # Register Handlers
 ptb_app.add_handler(CommandHandler("start", cmd_start))
@@ -588,7 +688,10 @@ ptb_app.add_handler(CommandHandler("addpoints", cmd_addpoints))
 ptb_app.add_handler(CommandHandler("broadcast", cmd_broadcast))
 
 # Menus & Media
-ptb_app.add_handler(MessageHandler(filters.Regex("^(📄 تلخيص PDF|🖼️ تصميم إنفوجرافيك|🎙️ تفريغ صوت|🌐 ترجمة|🛒 شحن نقاط|🔗 دعوة الأصدقاء|👤 حسابي)$"), menu_logic))
+ptb_app.add_handler(MessageHandler(
+    filters.Regex("^(📄 تلخيص PDF|🖼️ تصميم إنفوجرافيك|🎙️ تفريغ صوت|🌐 ترجمة|🛒 شحن نقاط|🔗 دعوة الأصدقاء|👤 حسابي)$"),
+    menu_logic
+))
 ptb_app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
 ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
 
