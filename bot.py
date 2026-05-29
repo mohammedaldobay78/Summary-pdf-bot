@@ -35,7 +35,6 @@ from telegram.ext import (
 # CONFIGURATION & LOGGING
 # =========================================================
 
-# توجيه السجلات إلى stdout ليظهر في Render
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -64,6 +63,14 @@ STAR_PACKAGES = {
     "pkg_2": {"stars": 10, "points": 30, "title": "الباقة الأساسية"},
     "pkg_3": {"stars": 25, "points": 100, "title": "الباقة المتقدمة"},
     "pkg_4": {"stars": 100, "points": 500, "title": "الباقة الاحترافية"}
+}
+
+# ربط أسماء الخدمات الداخلية بمفاتيح الحدود والتكاليف في قاعدة البيانات
+SERVICE_TO_LIMIT_KEY = {
+    "pdf": "pdf_count",
+    "translate": "translate_count",
+    "voice": "voice_count",
+    "infographic": "image_count"
 }
 
 # =========================================================
@@ -304,6 +311,7 @@ async def ai_worker():
             file_id = job.get("file_id")
             text = job.get("text")
             bot = job["bot"]
+            limit_key = job.get("limit_key")  # المفتاح المستخدم في الحدود والتكاليف
 
             # تحميل الملف إذا لزم
             file_path = None
@@ -329,6 +337,12 @@ async def ai_worker():
                         text=text,
                         prompt="ترجم النص إلى العربية باحترافية:"
                     )
+                elif service_type == "voice":
+                    # يمكن استخدام نفس معالجة الصوت إن دعمها Gemini لاحقاً، حالياً نستخدم النص المستخرج إن وجد
+                    result = await process_text_with_gemini(
+                        file_path=file_path,
+                        prompt="فرغ هذا المقطع الصوتي إلى نص مع ترجمته للعربية إن لم يكن عربياً."
+                    )
                 elif service_type == "infographic":
                     result = await generate_infographic(file_path=file_path, text_content=text)
                 else:
@@ -337,14 +351,18 @@ async def ai_worker():
 
                 # تحديث الحدود أو خصم النقاط بعد النجاح
                 limits = await check_and_reset_limits(user_id)
-                is_free = limits.get(service_type, 0) < DAILY_FREE_LIMITS.get(service_type, 0)
+                # إذا لم يتم تمرير limit_key في الوظيفة، نشتقه من service_type
+                if not limit_key:
+                    limit_key = SERVICE_TO_LIMIT_KEY.get(service_type, service_type)
+
+                is_free = limits.get(limit_key, 0) < DAILY_FREE_LIMITS.get(limit_key, 0)
 
                 if is_free:
                     await db_request("PATCH", "daily_limits",
                                      params={"user_id": f"eq.{user_id}"},
-                                     json_data={service_type: limits[service_type] + 1})
+                                     json_data={limit_key: limits[limit_key] + 1})
                 else:
-                    await update_points(user_id, -POINTS_COSTS[service_type])
+                    await update_points(user_id, -POINTS_COSTS[limit_key])
 
                 # إرسال النتيجة للمستخدم
                 if is_image:
@@ -465,8 +483,15 @@ async def enqueue_service(update: Update, context: ContextTypes.DEFAULT_TYPE, se
         limits = await check_and_reset_limits(user_id)
         user = await get_or_init_user(update.effective_user)
 
-        is_free = limits.get(service_type, 0) < DAILY_FREE_LIMITS.get(service_type, 0)
-        cost = POINTS_COSTS[service_type]
+        # تحويل اسم الخدمة إلى المفتاح المستخدم في الحدود والتكاليف
+        limit_key = SERVICE_TO_LIMIT_KEY.get(service_type)
+        if not limit_key:
+            logger.error(f"Invalid service_type enqueued: {service_type}")
+            await update.message.reply_text("❌ نوع خدمة غير معروف.")
+            return
+
+        is_free = limits.get(limit_key, 0) < DAILY_FREE_LIMITS.get(limit_key, 0)
+        cost = POINTS_COSTS.get(limit_key, 0)
 
         if not is_free and user.get("points", 0) < cost:
             await update.message.reply_text(
@@ -474,11 +499,12 @@ async def enqueue_service(update: Update, context: ContextTypes.DEFAULT_TYPE, se
             )
             return
 
-        # إضافة للطابور
+        # إضافة للطابور مع تخزين limit_key للاستخدام لاحقاً
         job = {
             "chat_id": update.effective_chat.id,
             "user_id": user_id,
             "service_type": service_type,
+            "limit_key": limit_key,
             "is_image": is_image,
             "file_id": file_id,
             "text": text,
@@ -487,7 +513,6 @@ async def enqueue_service(update: Update, context: ContextTypes.DEFAULT_TYPE, se
         await job_queue.put(job)
         await update.message.reply_text("⏳ تمت إضافة طلبك إلى قائمة الانتظار. سيتم إشعارك عند الانتهاء.")
 
-        # لا نحتاج للحالة بعد الآن
         context.user_data["state"] = None
 
     except Exception as e:
@@ -515,9 +540,14 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
     if state == "translate":
-        await enqueue_service(update, context, "translate_count", text=text)
+        await enqueue_service(update, context, "translate", text=text)
     elif state == "infographic":
-        await enqueue_service(update, context, "image_count", text=text, is_image=True)
+        await enqueue_service(update, context, "infographic", text=text, is_image=True)
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("state") == "voice":
+        voice = update.message.voice
+        await enqueue_service(update, context, "voice", file_id=voice.file_id)
 
 # =========================================================
 # POINTS TRANSFER & PAYMENTS
@@ -710,6 +740,10 @@ async def webhook(request: Request):
 async def health():
     return {"status": "running"}
 
+@fast_app.get("/")
+async def root():
+    return {"status": "bot is running"}
+
 # Register Handlers
 ptb_app.add_handler(CommandHandler("start", cmd_start))
 ptb_app.add_handler(CommandHandler("transfer", cmd_transfer))
@@ -725,6 +759,7 @@ ptb_app.add_handler(MessageHandler(
     menu_logic
 ))
 ptb_app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
+ptb_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
 
 # Payments
