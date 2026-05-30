@@ -115,8 +115,8 @@ class GeminiKeyManager:
 
     async def handle_error_and_rotate(self):
         """ينتظر 30 ثانية ثم ينتقل للمفتاح التالي بعد خطأ 429 أو 404."""
-        logger.warning(f"Key {self.index} hit rate limit/not found. Waiting 30s before switching.")
-        await asyncio.sleep(30)
+        logger.warning(f"Key {self.index} hit rate limit/not found. Waiting 3s before switching.")
+        await asyncio.sleep(3)
         async with self.lock:
             self.index = (self.index + 1) % len(self.keys)
             logger.info(f"Switched to key index {self.index}")
@@ -250,7 +250,7 @@ async def process_text_with_gemini(file_path=None, text=None, prompt=""):
             contents = f"{prompt}\n\n{text}"
 
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash",
             contents=contents
         )
         return response.text
@@ -269,18 +269,18 @@ async def generate_infographic(file_path=None, text_content=None):
                 await asyncio.sleep(2)
                 uploaded_file = client.files.get(name=uploaded_file.name)
             response_text = client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-2.5-flash",
                 contents=[uploaded_file, extract_prompt]
             ).text
         else:
             response_text = client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-2.5-flash",
                 contents=f"{extract_prompt}\n\n{text_content}"
             ).text
 
         image_prompt = response_text.strip()
         result = client.models.generate_images(
-            model='imagen-3.0-generate-001',
+            model="gemini-2.5-flash-image",
             prompt=f"Professional infographic vector art, clean design, highly detailed, modern flat style, 8k resolution. {image_prompt}",
             config=types.GenerateImagesConfig(
                 number_of_images=1,
